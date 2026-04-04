@@ -121,18 +121,9 @@ python main.py -b --config config.json          # 回测
 python main.py -l --config config.json          # 实盘
 
 # ━━ 行情监控 ━━
-python main.py BTCUSDT                          # BTC 30m
-python main.py ETHUSDT -i 1h                    # ETH 1h
+python main.py BTCUSDT                          # BTC 30m(实盘交易)
+python main.py ETHUSDT -i 1h                    # ETH 1h(实盘交易)
 python main.py BTCUSDT --dry-run                # 只分析不下单
-
-# ━━ 策略回测 ━━
-python main.py BTCUSDT --backtest               # 10x 默认 1000 根
-python main.py BTCUSDT -b --leverage 50         # 50x 回测
-python main.py ETHUSDT -b -i 1h --candles 2000  # ETH 1h 回测 2000 根
-python main.py BTCUSDT -b --capital 50000 --risk 0.01  # 自定义参数
-
-# 使用增强型策略
-python main.py BTCUSDT -b -s smc-enhanced       # 增强型 SMC 策略回测
 
 # 启用 DEBUG 日志（输出结构突破、FVG检测等详细信息）
 python main.py BTCUSDT -b --debug               # 回测并显示 DEBUG 信息
@@ -143,15 +134,15 @@ python main.py BTCUSDT -b --qty 0.01            # 每笔固定 0.01 BTC
 python main.py BTCUSDT -b --position-size 5000  # 每笔固定 5000 USDT
 
 # 回测结果导出 CSV
-python main.py BTCUSDT -b --export-csv trades.csv
-python main.py BTCUSDT -b --qty 0.01 --export-csv trades.csv
+python main.py BTCUSDT -b --export-csv yourfilename.csv
+python main.py BTCUSDT -b --qty 0.01 --export-csv yourfilename.csv
 
 # ━━ 实盘交易 ━━
 export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 python main.py BTCUSDT --live                                   # 10x 实盘 (风险公式)
 python main.py BTCUSDT -l --leverage 50                         # 50x 实盘
-python main.py BTCUSDT -l --api-key xxx --api-secret yyy       # 直接传参
+python main.py BTCUSDT -l --api-key xxx --api-secret yyy       # 使用其他账号时  直接传参
 
 # 固定仓位实盘
 python main.py BTCUSDT -l --qty 0.01 --api-key xxx --api-secret yyy           # 固定 0.01 BTC
@@ -192,7 +183,7 @@ python main.py BTCUSDT -l --position-size 5000 --api-key xxx --api-secret yyy # 
 
 ## CSV 导出格式
 
-使用 `--export-csv` 导出交易明细，UTF-8 with BOM 编码（Excel 直接打开无乱码）：
+使用 `--export-csv` 导出交易明细，UTF-8 with BOM 编码：
 
 | 开仓时间 | 出场时间 | 开仓方向 | 交易手数 | 入场价格 | 出场价格 | 出场原因 | 盈亏(USDT) | 账户余额 |
 |----------|---------|---------|---------|---------|---------|---------|-----------|----------|
