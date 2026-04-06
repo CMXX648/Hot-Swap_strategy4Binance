@@ -121,8 +121,8 @@ python main.py -b --config config.json          # 回测
 python main.py -l --config config.json          # 实盘
 
 # ━━ 行情监控 ━━
-python main.py BTCUSDT                          # BTC 30m(实盘交易)
-python main.py ETHUSDT -i 1h                    # ETH 1h(实盘交易)
+python main.py BTCUSDT                          # BTC 30m
+python main.py ETHUSDT -i 1h                    # ETH 1h
 python main.py BTCUSDT --dry-run                # 只分析不下单
 
 # 启用 DEBUG 日志（输出结构突破、FVG检测等详细信息）
@@ -327,3 +327,12 @@ K 线收盘标志 `k.x` 为 **BOOLEAN**：
 | `fstream.binance.com` | Futures WebSocket |
 
 > ⚠️ 国内可能无法直连 Binance，需要配置代理。
+
+## 版本更新
+
+### v1.0.1
+- **新增 webhook 通知功能**：支持通过钉钉 stream 模式和传统 webhook 方式发送交易通知
+- **支持钉钉 AppKey/AppSecret**：集成 dingtalk-stream SDK，使用官方推荐的认证方式
+- **多通知事件**：支持开仓、平仓、止损、止盈等交易事件的通知
+- **容错设计**：webhook 发送失败不影响交易执行，确保系统稳定性
+- **灵活配置**：支持通过命令行参数和配置文件设置 webhook 相关参数

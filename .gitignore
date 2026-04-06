@@ -37,8 +37,13 @@ ENV/
 historical_data/*
 logs/*
 *.log
+*.csv
 /home/ubuntu/bwebsocket/historical_data/*
 /home/ubuntu/bwebsocket/logs/*
+/root/smcbinance/engine/smc_enhanced.py
+/root/smcbinance/strategy/smc_enhanced.py
+/root/smcbinance/config_enhanced.json
+
 
 # OS
 .DS_Store

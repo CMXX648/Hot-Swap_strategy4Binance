@@ -89,6 +89,12 @@ _CLI_TO_CONFIG_KEY = {
     "api-key": "api_key",
     "api-secret": "api_secret",
     "margin-type": "margin_type",
+    "webhook-url": "webhook_url",
+    "webhook-type": "webhook_type",
+    "webhook-secret": "webhook_secret",
+    "app-key": "app_key",
+    "app-secret": "app_secret",
+    "notify-events": "notify_events",
     "log-dir": "log_dir",
     "config": "config",
     "debug": "debug",
@@ -377,6 +383,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-secret", type=str, default=None, help="Binance API Secret")
     parser.add_argument("--margin-type", type=str, default="ISOLATED",
                         choices=["ISOLATED", "CROSSED"], help="保证金模式 (默认 ISOLATED)")
+    
+    # Webhook 参数
+    parser.add_argument("--webhook-url", type=str, default="", help="Webhook URL (钉钉机器人)")
+    parser.add_argument("--webhook-type", type=str, default="dingtalk", choices=["dingtalk", "feishu", "telegram"], help="Webhook 类型")
+    parser.add_argument("--webhook-secret", type=str, default="", help="Webhook 签名密钥")
+    parser.add_argument("--app-key", type=str, default="", help="钉钉 AppKey")
+    parser.add_argument("--app-secret", type=str, default="", help="钉钉 AppSecret")
+    parser.add_argument("--notify-events", type=str, default="open,close,sl,tp,error", help="通知事件，逗号分隔")
+    
     parser.add_argument("--debug", action="store_true", help="启用 DEBUG 日志级别，输出结构突破、FVG检测等详细信息")
 
     return parser
@@ -448,6 +463,12 @@ def main():
             risk_pct=args.risk,
             fixed_position_size=args.position_size,
             fixed_qty=args.qty,
+            webhook_url=args.webhook_url,
+            webhook_type=args.webhook_type,
+            webhook_secret=args.webhook_secret,
+            app_key=args.app_key,
+            app_secret=args.app_secret,
+            notify_events=args.notify_events.split(",") if args.notify_events else ["open", "close", "sl", "tp", "error"]
         ))
         log.info("[LIVE] 实盘交易模式已激活")
 
