@@ -62,6 +62,47 @@ class BinanceREST:
             log.error(f"REST 请求失败: {e}")
             return []
 
+    def fetch_klines_since(self, symbol: str, interval: str, start_time_ms: int,
+                           limit: int = 100) -> List[Candle]:
+        """
+        拉取 start_time_ms 之后的已收盘 K 线，用于断线重连后补拉缺口。
+
+        Args:
+            start_time_ms: 开盘时间下界（毫秒），只返回 open_time > start_time_ms 的K线
+            limit:         最多拉取数量（通常断线几分钟，几十根足够）
+        """
+        url = (f"{self.base_url}{self.klines_endpoint}"
+               f"?symbol={symbol}&interval={interval}"
+               f"&startTime={start_time_ms + 1}&limit={limit}")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "SMC-Trader/1.3"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+
+            candles = []
+            for k in data:
+                # 只补入已收盘的 K 线（close_time < 当前时间）
+                import time as _time
+                if int(k[6]) < int(_time.time() * 1000):
+                    candles.append(Candle(
+                        open_time=int(k[0]),
+                        open=float(k[1]),
+                        high=float(k[2]),
+                        low=float(k[3]),
+                        close=float(k[4]),
+                        volume=float(k[5]),
+                        is_closed=True,
+                    ))
+            return candles
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            log.error(f"REST HTTP {e.code}: {body[:200]}")
+            return []
+        except Exception as e:
+            log.error(f"REST 请求失败: {e}")
+            return []
+
     def fetch_klines_batch(self, symbol: str, interval: str, total_limit: int = 5000,
                            batch_size: int = 1000) -> List[Candle]:
         """

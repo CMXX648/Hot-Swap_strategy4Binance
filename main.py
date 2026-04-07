@@ -89,12 +89,6 @@ _CLI_TO_CONFIG_KEY = {
     "api-key": "api_key",
     "api-secret": "api_secret",
     "margin-type": "margin_type",
-    "webhook-url": "webhook_url",
-    "webhook-type": "webhook_type",
-    "webhook-secret": "webhook_secret",
-    "app-key": "app_key",
-    "app-secret": "app_secret",
-    "notify-events": "notify_events",
     "log-dir": "log_dir",
     "config": "config",
     "debug": "debug",
@@ -167,6 +161,7 @@ manager: KlineManager | None = None
 ws_client: BinanceWebSocket | None = None
 trader: BinanceTrader | None = None
 log = logging.getLogger("Engine")
+_ws_connect_count: int = 0   # WebSocket 连接次数，用于区分首次连接和断线重连
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -204,11 +199,22 @@ def on_kline(data: dict, tick_count: int):
 
 
 def on_ws_open():
+    global _ws_connect_count
+    _ws_connect_count += 1
+
     if manager:
         log.info(f"  交易对: {manager.symbol}")
         log.info(f"  周期: {manager.interval}")
         log.info(f"  策略: {args.strategy}")
         log.info(f"  历史数据: {manager._bar_count} 根")
+
+        # 断线重连时补拉缺失的已收盘 K 线
+        if _ws_connect_count > 1:
+            log.info("[RECONNECT] 检测断线缺口，尝试补拉...")
+            filled = manager.fill_gap()
+            if filled:
+                log.info(manager.strategy.summary())
+
     if trader:
         balance = trader.get_balance("USDT")
         log.info(f"  💰 可用余额: ${balance:,.2f} USDT")
@@ -352,14 +358,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("symbol", nargs="?", default="BTCUSDT", help="交易对 (默认 BTCUSDT)")
     parser.add_argument("--config", type=str, default=None, metavar="PATH",
                         help="JSON 配置文件路径，CLI 参数优先于配置文件")
-    parser.add_argument("-s", "--strategy", default="smc",
-                        help=f"策略名称 (默认 smc)，可用: {available}")
+    parser.add_argument("-s", "--strategy", default="smc-enhanced",
+                        help=f"策略名称 (默认 smc-enhanced)，可用: {available}")
     parser.add_argument("--interval", "-i", default="30m", help="K线周期 (默认 30m)")
     parser.add_argument("--dry-run", "-d", action="store_true", help="只分析不下单")
     parser.add_argument("--sl", type=float, default=ATR_SL_MULT, help=f"止损 ATR 倍数 (默认 {ATR_SL_MULT})")
     parser.add_argument("--tp", type=float, default=ATR_TP_MULT, help=f"止盈 ATR 倍数 (默认 {ATR_TP_MULT})")
     parser.add_argument("--swing", type=int, default=SWING_LENGTH, help=f"摆动结构长度 (默认 {SWING_LENGTH})")
-    parser.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_SIZE, help="历史 K 线数量 (默认 200)")
+    parser.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_SIZE, help="历史 K 线数量 (默认 300)")
     parser.add_argument("--leverage", type=int, default=DEFAULT_LEVERAGE, help=f"杠杆倍数 (默认 {DEFAULT_LEVERAGE})")
     parser.add_argument("--log-dir", type=str, default=LOG_DIR, metavar="DIR",
                         help=f"日志文件目录 (默认 {LOG_DIR})，空字符串关闭文件日志")
@@ -383,15 +389,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-secret", type=str, default=None, help="Binance API Secret")
     parser.add_argument("--margin-type", type=str, default="ISOLATED",
                         choices=["ISOLATED", "CROSSED"], help="保证金模式 (默认 ISOLATED)")
-    
-    # Webhook 参数
-    parser.add_argument("--webhook-url", type=str, default="", help="Webhook URL (钉钉机器人)")
-    parser.add_argument("--webhook-type", type=str, default="dingtalk", choices=["dingtalk", "feishu", "telegram"], help="Webhook 类型")
-    parser.add_argument("--webhook-secret", type=str, default="", help="Webhook 签名密钥")
-    parser.add_argument("--app-key", type=str, default="", help="钉钉 AppKey")
-    parser.add_argument("--app-secret", type=str, default="", help="钉钉 AppSecret")
-    parser.add_argument("--notify-events", type=str, default="open,close,sl,tp,error", help="通知事件，逗号分隔")
-    
     parser.add_argument("--debug", action="store_true", help="启用 DEBUG 日志级别，输出结构突破、FVG检测等详细信息")
 
     return parser
@@ -463,12 +460,6 @@ def main():
             risk_pct=args.risk,
             fixed_position_size=args.position_size,
             fixed_qty=args.qty,
-            webhook_url=args.webhook_url,
-            webhook_type=args.webhook_type,
-            webhook_secret=args.webhook_secret,
-            app_key=args.app_key,
-            app_secret=args.app_secret,
-            notify_events=args.notify_events.split(",") if args.notify_events else ["open", "close", "sl", "tp", "error"]
         ))
         log.info("[LIVE] 实盘交易模式已激活")
 

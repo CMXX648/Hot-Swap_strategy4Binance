@@ -1,0 +1,17 @@
+[Unit]
+Description=SMC Binance Futures Trading Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/your_file_path/strategy
+EnvironmentFile=-/your_file_path/smctrade.env
+ExecStart=/your_file_path/strategy/venv/bin/python /your_file_path/strategy/main.py -l --config /your_file_path/strategy/config_enhanced.json
+Restart=always
+RestartSec=5
+StandardOutput=append:/your_file_path/strategy/logs/smctrade-service.log
+StandardError=append:/your_file_path/strategy/logs/smctrade-service.log
+
+[Install]
+WantedBy=default.target

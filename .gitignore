@@ -37,18 +37,29 @@ ENV/
 historical_data/*
 logs/*
 *.log
-*.csv
-/home/ubuntu/bwebsocket/historical_data/*
-/home/ubuntu/bwebsocket/logs/*
-/root/smcbinance/engine/smc_enhanced.py
-/root/smcbinance/strategy/smc_enhanced.py
-/root/smcbinance/config_enhanced.json
-
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Config with sensitive data
-# config.json
-# config.py
+# ━━ 敏感配置文件（含 API Key / Secret）━━
+smctrade.env
+config.json
+config_enhanced.json
+
+# ━━ systemd 服务部署文件（含本机路径）━━
+smctrade.service
+smctrade
+
+# ━━ 交易流水（含真实交易数据）━━
+trades.csv
+trades_enhanced.csv
+*.csv
+
+# ━━ 连接测试脚本（开发用，非生产必要）━━
+binance_connection_test.py
+dtest.py
+
+# ━━ 模板文件保留，真实文件忽略 ━━
+# smctrade.env.example  ← 保留上传
+# smctrade.service.example  ← 保留上传

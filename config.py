@@ -45,7 +45,7 @@ WS_PING_INTERVAL      = 180     # ping 间隔（秒），Binance 要求 ≤ 3min
 WS_PING_TIMEOUT       = 10      # ping 超时（秒）
 
 # ━━ 历史数据 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DEFAULT_BUFFER_SIZE = 200       # 默认历史 K 线拉取数量
+DEFAULT_BUFFER_SIZE = 300       # 默认历史 K 线拉取数量
 
 # ━━ 合约风控参数 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEFAULT_LEVERAGE          = 10      # 默认杠杆

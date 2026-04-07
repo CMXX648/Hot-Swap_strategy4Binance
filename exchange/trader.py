@@ -6,6 +6,7 @@ API 认证 + 下单 + 止损止盈 + 持仓管理 (USDT-M 合约专用)
 认证方式：HMAC-SHA256 签名
 """
 
+import base64
 import json
 import time
 import hmac
@@ -14,18 +15,56 @@ import logging
 import urllib.request
 import urllib.parse
 import urllib.error
+import os
 from typing import Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-
-# 尝试导入 dingtalk-stream SDK
-try:
-    from dingtalk_stream import DingtalkStreamClient
-except ImportError:
-    DingtalkStreamClient = None
 
 from config import FUTURES_REST_BASE, get_mmr
 from models import Bias, TradeSignal
+
+DINGTALK_ROBOT_URL = os.environ.get("DINGTALK_ROBOT_URL")
+DINGTALK_ROBOT_SECRET = os.environ.get("DINGTALK_ROBOT_SECRET", "")
+
+
+def _build_dingtalk_robot_url() -> Optional[str]:
+    if not DINGTALK_ROBOT_URL:
+        return None
+    if not DINGTALK_ROBOT_SECRET:
+        return DINGTALK_ROBOT_URL
+
+    timestamp = str(int(time.time() * 1000))
+    sign_str = f"{timestamp}\n{DINGTALK_ROBOT_SECRET}"
+    sign = base64.b64encode(hmac.new(
+        DINGTALK_ROBOT_SECRET.encode(),
+        sign_str.encode(),
+        hashlib.sha256
+    ).digest()).decode()
+
+    separator = '&' if '?' in DINGTALK_ROBOT_URL else '?'
+    return f"{DINGTALK_ROBOT_URL}{separator}timestamp={timestamp}&sign={urllib.parse.quote_plus(sign)}"
+
+
+def _send_dingtalk_text(content: str) -> None:
+    url = _build_dingtalk_robot_url()
+    if not url:
+        return
+
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = json.dumps({
+        "msgtype": "text",
+        "text": {"content": content},
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_data = resp.read().decode()
+            log.debug(f"DingTalk 通知已发送: {resp_data}")
+    except Exception as exc:
+        log.error(f"DingTalk 通知发送失败: {exc}")
 
 log = logging.getLogger("Trader")
 
@@ -88,12 +127,6 @@ class TraderConfig:
     max_position_age: int = 86400      # 最大持仓时间（秒），0=不限
     fixed_position_size: float = 0.0   # 固定仓位大小 (USDT)，0=不固定
     fixed_qty: float = 0.0             # 固定开仓数量 (币种)，0=不固定
-    webhook_url: str = ""              # webhook URL
-    webhook_type: str = "dingtalk"     # 支持: dingtalk, feishu, telegram
-    webhook_secret: str = ""           # 签名密钥（可选）
-    app_key: str = ""                  # 钉钉 AppKey
-    app_secret: str = ""                # 钉钉 AppSecret
-    notify_events: list = field(default_factory=lambda: ["open", "close", "sl", "tp", "error"])  # 通知事件
 
 
 class BinanceTrader:
@@ -114,63 +147,12 @@ class BinanceTrader:
         self.position: Optional[Position] = None
         self.orders: Dict[int, Order] = {}
         self._recv_window = 5000
-        
-    def _send_webhook(self, message: str, event_type: str):
-        """发送 webhook 通知（非阻塞，发送失败不影响交易）"""
-        if event_type not in self.config.notify_events:
+
+    def _notify(self, message: str) -> None:
+        """通过钉钉机器人发送实时提醒。"""
+        if not DINGTALK_ROBOT_URL:
             return
-        
-        try:
-            # 优先使用 dingtalk-stream SDK
-            if DingtalkStreamClient and self.config.app_key and self.config.app_secret:
-                # 使用 dingtalk-stream SDK 发送通知
-                client = DingtalkStreamClient(
-                    client_id=self.config.app_key,
-                    client_secret=self.config.app_secret,
-                )
-                
-                # 构建消息
-                msg = {
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": f"交易通知 - {event_type.upper()}",
-                        "text": message
-                    }
-                }
-                
-                # 发送消息到钉钉 stream
-                # 注意：这里需要根据 dingtalk-stream SDK 的实际 API 进行调整
-                # 由于我们没有实际运行环境，这里使用占位符实现
-                log.debug(f"使用 dingtalk-stream SDK 发送通知: {event_type}")
-                # client.send_message(msg)
-                
-            # 回退到传统 webhook 方式
-            elif self.config.webhook_url:
-                # 构建钉钉 webhook 消息
-                payload = {
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": f"交易通知 - {event_type.upper()}",
-                        "text": message
-                    }
-                }
-                
-                # 发送请求
-                headers = {"Content-Type": "application/json"}
-                data = json.dumps(payload).encode('utf-8')
-                req = urllib.request.Request(
-                    self.config.webhook_url,
-                    data=data,
-                    headers=headers,
-                    method="POST"
-                )
-                
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    log.debug(f"Webhook 发送成功: {resp.status}")
-                    
-        except Exception as e:
-            log.error(f"Webhook 发送失败: {e}")
-            # 静默失败，不影响交易执行
+        _send_dingtalk_text(message)
 
     # ━━━ API 签名 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -218,9 +200,11 @@ class BinanceTrader:
         except urllib.error.HTTPError as e:
             body = e.read().decode() if e.fp else ""
             log.error(f"API 错误 {e.code}: {body[:300]}")
+            self._notify(f"[SMC] API 错误 {e.code}: {body[:300]}")
             return None
         except Exception as e:
             log.error(f"请求异常: {e}")
+            self._notify(f"[SMC] 请求异常: {e}")
             return None
 
     def _get(self, path: str, params=None, signed=False):
@@ -394,6 +378,7 @@ class BinanceTrader:
         )
         self.orders[order.order_id] = order
         log.info(f"[OK] 市价单: {side.value} {quantity:.6f} {symbol} (orderId={order.order_id})")
+        self._notify(f"[SMC] 市价单成功：{symbol} {side.value} {quantity:.6f}，orderId={order.order_id}")
         return order
 
     def place_stop_loss(self, symbol: str, side: OrderSide,
@@ -419,6 +404,7 @@ class BinanceTrader:
         )
         self.orders[order.order_id] = order
         log.info(f"🛡️ 止损单: orderId={order.order_id} @ ${stop_price:,.2f}")
+        self._notify(f"[SMC] 止损单已提交：{symbol} {side.value} {quantity:.6f}，stop={stop_price:.2f}，orderId={order.order_id}")
         return order
 
     def place_take_profit(self, symbol: str, side: OrderSide,
@@ -444,6 +430,7 @@ class BinanceTrader:
         )
         self.orders[order.order_id] = order
         log.info(f"🎯 止盈单: orderId={order.order_id} @ ${tp_price:,.2f}")
+        self._notify(f"[SMC] 止盈单已提交：{symbol} {side.value} {quantity:.6f}，tp={tp_price:.2f}，orderId={order.order_id}")
         return order
 
     def cancel_order(self, symbol: str, order_id: int) -> bool:
@@ -461,20 +448,25 @@ class BinanceTrader:
 
     def on_signal(self, signal: TradeSignal, symbol: str) -> bool:
         """处理交易信号 — 完整下单流程"""
+        self._notify(f"[SMC] 收到交易信号：{symbol} {signal.direction.name}，入场={signal.entry_price:.2f}，止损={signal.stop_loss:.2f}，止盈={signal.take_profit:.2f}")
+
         # 1. 检查持仓
         if self.position:
             log.warning(f"已有持仓，跳过")
+            self._notify(f"[SMC] 已有持仓，跳过本次信号")
             return False
 
         pos_info = self.get_position(symbol)
         if pos_info and float(pos_info.get("positionAmt", 0)) != 0:
             log.warning(f"账户已有 {symbol} 持仓")
+            self._notify(f"[SMC] 账户已有 {symbol} 持仓，跳过本次信号")
             return False
 
         # 2. 获取余额
         balance = self.get_balance("USDT")
         if balance <= 0:
             log.error("USDT 余额不足")
+            self._notify(f"[SMC] USDT 余额不足，无法开仓")
             return False
 
         # 3. 计算仓位
@@ -496,10 +488,12 @@ class BinanceTrader:
         if signal.direction == Bias.BULLISH:
             if liq_price >= signal.stop_loss:
                 log.error(f"爆仓价 ${liq_price:,.2f} >= 止损价，爆仓将先触发，放弃")
+                self._notify(f"[SMC] 放弃开仓：爆仓价 ${liq_price:,.2f} >= 止损价")
                 return False
         else:
             if liq_price <= signal.stop_loss:
                 log.error(f"爆仓价 ${liq_price:,.2f} <= 止损价，爆仓将先触发，放弃")
+                self._notify(f"[SMC] 放弃开仓：爆仓价 ${liq_price:,.2f} <= 止损价")
                 return False
 
         # 5. 合约设置
@@ -513,6 +507,7 @@ class BinanceTrader:
         entry_order = self.place_market_order(symbol, entry_side, quantity)
         if not entry_order:
             log.error("入场单失败")
+            self._notify(f"[SMC] 入场单失败：{symbol} {entry_side.value} {quantity:.6f}")
             return False
 
         sl_order = self.place_stop_loss(symbol, close_side, quantity, signal.stop_loss)
@@ -548,24 +543,6 @@ class BinanceTrader:
         log.info(f"  爆仓: ${liq_price:,.2f}")
         log.info(f"━━━━━━━━━━━━━━━━")
 
-        # 发送开仓通知
-        message = f"""
-# 🔔 开仓通知
-
-**交易对**: {symbol}
-**方向**: {d}
-**杠杆**: {self.config.leverage}x
-**数量**: {quantity:.6f}
-**仓位**: ${position_size:,.2f}
-**保证金**: ${margin:,.2f}
-**入场价**: ${signal.entry_price:,.2f}
-**止损价**: ${signal.stop_loss:,.2f}
-**止盈价**: ${signal.take_profit:,.2f}
-**爆仓价**: ${liq_price:,.2f}
-**时间**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
-"""
-        self._send_webhook(message, "open")
-
         return True
 
     def close_position(self, symbol: str, reason: str = "手动平仓") -> bool:
@@ -582,31 +559,8 @@ class BinanceTrader:
         close_order = self.place_market_order(symbol, close_side, self.position.quantity)
 
         if close_order:
-            # 计算盈亏
-            current_price = close_order.filled_price
-            entry_price = self.position.entry_price
-            pnl = (current_price - entry_price) * self.position.quantity if self.position.direction == Bias.BULLISH else (entry_price - current_price) * self.position.quantity
-            
             log.info(f"📤 已平仓 ({reason})")
-            log.info(f"📊 盈亏: ${pnl:,.2f}")
-            
-            # 发送平仓通知
-            direction = "做多" if self.position.direction == Bias.BULLISH else "做空"
-            message = f"""
-# 📤 平仓通知
-
-**交易对**: {symbol}
-**方向**: {direction}
-**杠杆**: {self.position.leverage}x
-**数量**: {self.position.quantity:.6f}
-**入场价**: ${self.position.entry_price:,.2f}
-**平仓价**: ${current_price:,.2f}
-**盈亏**: ${pnl:,.2f}
-**原因**: {reason}
-**时间**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
-"""
-            self._send_webhook(message, "close")
-            
+            self._notify(f"[SMC] 平仓成功：{symbol} {close_side.value} {self.position.quantity:.6f}，原因：{reason}")
             self.position = None
             return True
         return False
@@ -623,21 +577,6 @@ class BinanceTrader:
             }, signed=True)
             if sl and sl.get("status") == "FILLED":
                 log.info(f"🛡️ 止损已触发")
-                
-                # 发送止损通知
-                direction = "做多" if self.position.direction == Bias.BULLISH else "做空"
-                message = f"""
-# 🛡️ 止损触发
-
-**交易对**: {symbol}
-**方向**: {direction}
-**杠杆**: {self.position.leverage}x
-**入场价**: ${self.position.entry_price:,.2f}
-**止损价**: ${self.position.stop_loss:,.2f}
-**时间**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
-"""
-                self._send_webhook(message, "sl")
-                
                 if self.position.tp_order_id:
                     self.cancel_order(symbol, self.position.tp_order_id)
                 self.position = None
@@ -650,21 +589,6 @@ class BinanceTrader:
             }, signed=True)
             if tp and tp.get("status") == "FILLED":
                 log.info(f"🎯 止盈已触发")
-                
-                # 发送止盈通知
-                direction = "做多" if self.position.direction == Bias.BULLISH else "做空"
-                message = f"""
-# 🎯 止盈触发
-
-**交易对**: {symbol}
-**方向**: {direction}
-**杠杆**: {self.position.leverage}x
-**入场价**: ${self.position.entry_price:,.2f}
-**止盈价**: ${self.position.take_profit:,.2f}
-**时间**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
-"""
-                self._send_webhook(message, "tp")
-                
                 if self.position.sl_order_id:
                     self.cancel_order(symbol, self.position.sl_order_id)
                 self.position = None

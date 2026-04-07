@@ -2,6 +2,15 @@
 
 基于 Binance Futures WebSocket 实时数据 + 可热拔插策略的量化交易系统。
 
+## 更新日志
+
+### v1.0.2 (2026-04-07)
+- **新增**：`exchange/binance.py` 新增 `fetch_klines_since()` 方法，支持从指定时间戳向后拉取已收盘 K 线，用于断线重连后补拉缺口
+- **新增**：`exchange/kline.py` 新增 `fill_gap()` 方法，记录最后已收盘 K 线时间戳，重连时自动补拉丢失 K 线并送入策略引擎，保持结构状态连续
+- **新增**：`main.py` 新增 WebSocket 连接计数 `_ws_connect_count`，断线重连时自动触发 `fill_gap()`
+- **修改**：默认策略由 `smc` 改为 `smc-enhanced`，历史回测与实盘保持一致
+- **修改**：默认历史 K 线缓存数量 `--buffer` 从 200 增大至 300，提升策略初始化精度
+
 ## 核心亮点
 
 ### 策略热拔插架构
@@ -121,8 +130,8 @@ python main.py -b --config config.json          # 回测
 python main.py -l --config config.json          # 实盘
 
 # ━━ 行情监控 ━━
-python main.py BTCUSDT                          # BTC 30m
-python main.py ETHUSDT -i 1h                    # ETH 1h
+python main.py BTCUSDT                          # BTC 30m(实盘交易)
+python main.py ETHUSDT -i 1h                    # ETH 1h(实盘交易)
 python main.py BTCUSDT --dry-run                # 只分析不下单
 
 # 启用 DEBUG 日志（输出结构突破、FVG检测等详细信息）
@@ -154,14 +163,14 @@ python main.py BTCUSDT -l --position-size 5000 --api-key xxx --api-secret yyy # 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `symbol` | BTCUSDT | 交易对 |
-| `-s`, `--strategy` | smc | 策略名称（可用: smc, smc-enhanced） |
+| `-s`, `--strategy` | smc-enhanced | 策略名称（可用: smc, smc-enhanced） |
 | `--config` | 无 | JSON 配置文件路径，CLI 参数优先于配置文件 |
 | `--interval`, `-i` | 30m | K 线周期 |
 | `--dry-run`, `-d` | 关 | 只分析不下单 |
 | `--sl` | 1.5 | 止损 ATR 倍数 |
 | `--tp` | 3.0 | 止盈 ATR 倍数 |
 | `--swing` | 50 | 摆动结构识别窗口 |
-| `--buffer` | 200 | 历史 K 线数量 |
+| `--buffer` | 300 | 历史 K 线数量 |
 | `--leverage` | 10 | 杠杆倍数 |
 | `--log-dir` | logs | 日志文件目录，空字符串关闭文件日志 |
 | **仓位控制（回测 & 实盘通用）** | | |
@@ -327,12 +336,3 @@ K 线收盘标志 `k.x` 为 **BOOLEAN**：
 | `fstream.binance.com` | Futures WebSocket |
 
 > ⚠️ 国内可能无法直连 Binance，需要配置代理。
-
-## 版本更新
-
-### v1.0.1
-- **新增 webhook 通知功能**：支持通过钉钉 stream 模式和传统 webhook 方式发送交易通知
-- **支持钉钉 AppKey/AppSecret**：集成 dingtalk-stream SDK，使用官方推荐的认证方式
-- **多通知事件**：支持开仓、平仓、止损、止盈等交易事件的通知
-- **容错设计**：webhook 发送失败不影响交易执行，确保系统稳定性
-- **灵活配置**：支持通过命令行参数和配置文件设置 webhook 相关参数

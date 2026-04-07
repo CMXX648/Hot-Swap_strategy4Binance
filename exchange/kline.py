@@ -37,6 +37,7 @@ class KlineManager:
         self.current_candle: Optional[Candle] = None
         self.signals: List[TradeSignal] = []
         self._bar_count = 0
+        self._last_closed_time: int = 0   # 最后一根已收盘 K 线的 open_time（毫秒）
 
     def load_history(self) -> int:
         """通过 REST API 加载历史 K 线"""
@@ -45,8 +46,48 @@ class KlineManager:
         for candle in candles:
             self.strategy.update(candle)
             self._bar_count += 1
+            self._last_closed_time = candle.open_time
 
         return len(candles)
+
+    def fill_gap(self) -> int:
+        """
+        断线重连后补拉缺失的已收盘 K 线。
+
+        原理：记录上次收到的已收盘 K 线时间戳，重连后从该时间戳之后
+        向 REST API 拉取遗漏的 K 线，依次送入策略引擎保持结构连续。
+
+        Returns:
+            补拉并送入策略的 K 线数量（0 表示无缺口或拉取失败）
+        """
+        if self._last_closed_time == 0:
+            return 0
+
+        candles = self.rest.fetch_klines_since(
+            self.symbol, self.interval,
+            start_time_ms=self._last_closed_time,
+            limit=100,
+        )
+
+        if not candles:
+            return 0
+
+        count = 0
+        for candle in candles:
+            # 严格去重：只处理比上次记录更新的 K 线
+            if candle.open_time <= self._last_closed_time:
+                continue
+            self.strategy.update(candle)
+            self._bar_count += 1
+            self._last_closed_time = candle.open_time
+            count += 1
+
+        if count:
+            log.info(f"[GAP FILL] 补拉 {count} 根缺失 K 线，最新: {self._last_closed_time}")
+        else:
+            log.info("[GAP FILL] 无缺口，结构连续")
+
+        return count
 
     def on_kline_event(self, data: Dict) -> Optional[TradeSignal]:
         """
@@ -66,6 +107,9 @@ class KlineManager:
 
         self.current_candle = candle
         signal = self.strategy.update(candle)
+
+        if candle.is_closed:
+            self._last_closed_time = candle.open_time
 
         if signal:
             self.signals.append(signal)

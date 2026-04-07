@@ -1,2 +1,4 @@
 websocket-client>=1.6.0
+websockets
+python-socks
 dingtalk-stream
