@@ -295,8 +295,6 @@ class DryRunTrader:
                 split_full_qty=quantity,
                 split_fvg_top=signal.entry_top,
                 split_fvg_bottom=signal.entry_bottom,
-                split_fvg_top=signal.entry_top,
-                split_fvg_bottom=signal.entry_bottom,
             )
 
             log.info(f"━━━ [DRY-RUN] 分拆建仓模拟 ━━━")
