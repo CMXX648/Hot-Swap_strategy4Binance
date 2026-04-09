@@ -101,6 +101,172 @@ ATR 衡量市场波动率，用于：
 - 确保内部结构和摆动结构趋势一致
 - 避免在趋势不明确时入场
 
+---
+
+## 开仓逻辑详解（`engine/smc.py` → `_check_trade_signal`）
+
+开仓判断在每根 K 线（或实时 tick）推入引擎时执行，完整流程如下：
+
+### 第一步：前置条件检查
+
+| 条件 | 说明 |
+|------|------|
+| `ATR > 0` | ATR 暖机完成（至少 `ATR_PERIOD` 根 K 线） |
+| `swing_trend != NEUTRAL` | 摆动趋势已确立（经历过 BOS 或 CHoCH） |
+| `internal_trend == swing_trend`（可选） | 双周期共振；由 `INTERNAL_CONFIRM=True` 控制, `internal_trend` 仍为 NEUTRAL 时跳过该检查 |
+
+任一条件不满足，本轮不开仓。
+
+---
+
+### 第二步：遍历活跃 FVG 池，寻找匹配缺口
+
+对每个 FVG 进行以下过滤：
+
+1. **方向一致**：`fvg.bias == swing_trend`
+2. **未触发**：`fvg.triggered == False`（同一 FVG 不重复开仓）
+3. **未过期**：`当前 K 线索引 - fvg.created_bar <= FVG_MAX_AGE`（默认 50 根，超过则淘汰）
+
+---
+
+### 第三步：判断价格是否已回踩至 FVG 触发区
+
+找到方向匹配的 FVG 后，判断触发模式（按优先级）：
+
+#### 模式 A：大 FVG 分拆建仓（优先）
+
+**触发条件**：`FVG_SPLIT_ENABLED=True` 且 `FVG 高度 >= ATR × 1.5`
+
+价格进入 **FVG 近端区间**即触发：
+
+| 方向 | 近端区间（收盘 K 线） | 近端区间（实时 tick） |
+|------|----------------------|----------------------|
+| 看涨 | `fvg_mid < close <= fvg.top` 或 `low <= fvg.top 且 close >= fvg_mid` | `fvg_mid < 当前价 <= fvg.top` |
+| 看跌 | `fvg.bottom <= close < fvg_mid` 或 `high >= fvg.bottom 且 close <= fvg_mid` | `fvg.bottom <= 当前价 < fvg_mid` |
+
+触发后执行**分拆建仓**：
+- **30%** 仓位：**市价单**立即开仓（价格已在 FVG 近端）
+- **70%** 仓位：在 **FVG 中点**挂**限价单**，等待更深回踩
+- 止盈止损统一按完整仓位设置
+
+#### 模式 B：标准 FVG 中点回踩（常规）
+
+价格到达 **FVG 中点或更深区间**：
+
+| 方向 | 触发区间（收盘 K 线，含插针捕获） | 触发区间（实时 tick） |
+|------|----------------------------------|----------------------|
+| 看涨 | `fvg.bottom <= close <= fvg_mid` 或 `low <= fvg_mid 且 close >= fvg.bottom` | `fvg.bottom <= 当前价 <= fvg_mid` |
+| 看跌 | `fvg_mid <= close <= fvg.top` 或 `high >= fvg_mid 且 close <= fvg.top` | `fvg_mid <= 当前价 <= fvg.top` |
+
+> 收盘 K 线模式额外捕获**插针入场**（K 线最低/高价扫过中点但收盘已出区间的情况）。
+
+触发后以 **FVG 中点**作为入场价执行**市价单**开仓。
+
+---
+
+### 第四步：止损计算
+
+`entry_price = (fvg.top + fvg.bottom) / 2`
+
+#### 做多止损（BULLISH）
+
+```
+结构止损 = swing_low - ATR × 0.5
+OB支撑止损 = 最近看涨OB下沿 - ATR × 0.3
+
+最终止损 = min(结构止损, OB支撑止损中更紧的)
+硬限 = min(最终止损, fvg.bottom - ATR × 0.1)   # 确保在 FVG 下方
+```
+
+OB 止损选择规则：`OB止损 > fvg.bottom - ATR×0.1` **且** `OB风险 < 结构风险` → 使用 OB 止损（更紧），否则用结构止损。
+
+#### 做空止损（BEARISH）
+
+```
+结构止损 = swing_high + ATR × 0.5
+OB阻力止损 = 最近看跌OB上沿 + ATR × 0.3
+
+最终止损 = max(结构止损, OB阻力止损中更紧的)
+硬限 = max(最终止损, fvg.top + ATR × 0.1)   # 确保在 FVG 上方
+```
+
+---
+
+### 第五步：止盈计算（自适应）
+
+**止盈倍数自适应**（`TP_ADAPTIVE=True`）：
+
+```
+ratio = ATR_当前 / ATR_前一根
+ratio < 0.8  → tp_mult × 0.6  （低波动, 缩短目标）
+ratio > 1.3  → tp_mult × 1.5  （高波动, 放大目标）
+否则          → tp_mult × 1.0  （正常）
+```
+
+#### 做多止盈
+
+```
+ATR止盈 = entry + ATR × tp_mult(自适应)
+OB阻力止盈 = 最近看跌OB上沿 - ATR × 0.3
+
+优先 OB 止盈（当 OB止盈 > entry 且 R:R_OB >= R:R_ATR 时）
+否则使用 ATR 止盈
+```
+
+#### 做空止盈
+
+```
+ATR止盈 = entry - ATR × tp_mult(自适应)
+OB支撑止盈 = 最近看涨OB下沿 + ATR × 0.3
+
+优先 OB 止盈（当 OB止盈 < entry 且 R:R_OB >= R:R_ATR 时）
+否则使用 ATR 止盈
+```
+
+---
+
+### 第六步：盈亏比过滤 & 信号发出
+
+```
+risk   = |entry - stop_loss|
+reward = |take_profit - entry|
+R:R    = reward / risk
+
+R:R < 1.0 → 丢弃信号，本轮不开仓
+```
+
+通过所有过滤后：
+1. 生成 `TradeSignal`（含方向、入场价、止损、止盈、ATR、触发 FVG、趋势依据）
+2. 将触发 FVG 标记为 `triggered=True`，防止重复信号
+3. 信号传递给执行层下单
+
+---
+
+### 开仓流程总览
+
+```
+每根K线/tick
+    │
+    ├─ ATR = 0 或 swing_trend = NEUTRAL ？ → 不开仓
+    │
+    ├─ INTERNAL_CONFIRM 且 internal ≠ swing ？ → 不开仓
+    │
+    └─ 遍历 FVG 池
+           │
+           ├─ 方向不符 / 已触发 / 已过期？ → 跳过
+           │
+           ├─ 大FVG + 价格在近端？ → [分拆建仓] 30%市价 + 70%限价@中点
+           │
+           └─ 价格在中点附近？ → [标准建仓] 市价@中点
+                   │
+                   ├─ 计算止损（结构/OB，取更紧，硬限FVG边界外）
+                   ├─ 计算止盈（ATR自适应/OB，取R:R更优）
+                   ├─ R:R < 1.0？ → 丢弃
+                   └─ 发出 TradeSignal，FVG.triggered = True
+```
+
+---
+
 ### 止损设置
 
 ```
