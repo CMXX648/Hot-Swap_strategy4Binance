@@ -1,0 +1,19 @@
+[Unit]
+Description=SMC Log Web Viewer Service
+After=network-online.target
+Wants=network-online.target
+PartOf=smctrade.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/strategy
+EnvironmentFile=-/home/ubuntu/strategy/smctrade.env
+# Optional: set token in env file, e.g. LOG_WEB_TOKEN=your_token
+ExecStart=/home/ubuntu/strategy/venv/bin/python /home/ubuntu/strategy/log_web.py --host 0.0.0.0 --port 8080 --log-file /home/ubuntu/strategy/logs/smctrade-service.log
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/ubuntu/strategy/logs/smclogweb-service.log
+StandardError=append:/home/ubuntu/strategy/logs/smclogweb-service.log
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from config import FUTURES_REST_BASE, get_mmr
+from config import (
+    DAILY_LOSS_LIMIT, MAX_CONSECUTIVE_LOSSES, LOSS_FREEZE_CANDLES,
+)
 from models import Bias, TradeSignal
 
 DINGTALK_ROBOT_URL = os.environ.get("DINGTALK_ROBOT_URL")
@@ -112,6 +115,8 @@ class Position:
     entry_time: int = 0
     stop_loss: float = 0.0
     take_profit: float = 0.0
+    second_leg_order_id: int = 0   # FVG分拆建仓: 70%限价单的orderId（0=无挂单）
+    split_full_qty: float = 0.0    # FVG分拆建仓: 完整预期数量（用于SL/TP订单的数量）
 
 
 @dataclass
@@ -147,6 +152,13 @@ class BinanceTrader:
         self.position: Optional[Position] = None
         self.orders: Dict[int, Order] = {}
         self._recv_window = 5000
+        # P2修复: 每日亏损熔断追踪
+        import datetime
+        self._daily_start_date: str = datetime.date.today().isoformat()
+        self._daily_start_balance: float = 0.0   # 当日首笔交易前的余额
+        self._daily_realized_pnl: float = 0.0    # 当日已实现盈亏（USDT）
+        self._consecutive_losses: int = 0         # 连续亏损次数
+        self._freeze_candles_remaining: int = 0   # 熔断后剩余冻结K线数
 
     def _notify(self, message: str) -> None:
         """通过钉钉机器人发送实时提醒。"""
@@ -243,6 +255,70 @@ class BinanceTrader:
         return None
 
     # ━━━ 合约设置 ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # ━━━ 熔断机制 ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _reset_daily_if_needed(self):
+        """若日期已切换，重置每日盈亏统计"""
+        import datetime
+        today = datetime.date.today().isoformat()
+        if today != self._daily_start_date:
+            log.info(f"[CIRCUIT] 日期切换 ({self._daily_start_date} → {today})，重置每日盈亏统计")
+            self._daily_start_date = today
+            self._daily_start_balance = 0.0
+            self._daily_realized_pnl = 0.0
+            self._consecutive_losses = 0
+
+    def _update_pnl_tracking(self, pnl: float, balance: float = 0.0):
+        """
+        P2: 更新每日盈亏和连续亏损计数
+        - pnl: 本笔实现盈亏（USDT，正=赢，负=亏）
+        - balance: 当前账户余额（用于计算亏损占比）
+        """
+        self._reset_daily_if_needed()
+        self._daily_realized_pnl += pnl
+
+        if pnl < 0:
+            self._consecutive_losses += 1
+            log.info(f"[CIRCUIT] 亏损笔: {pnl:.2f} USDT | 连续亏损: {self._consecutive_losses} | 当日累计: {self._daily_realized_pnl:.2f} USDT")
+            if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                self._freeze_candles_remaining = LOSS_FREEZE_CANDLES
+                log.warning(f"[CIRCUIT] 连续亏损 {self._consecutive_losses} 笔，触发冻结 {LOSS_FREEZE_CANDLES} 根K线")
+                self._notify(f"[SMC] 熔断触发：连续亏损 {self._consecutive_losses} 笔，暂停交易 {LOSS_FREEZE_CANDLES} 根K线")
+        else:
+            self._consecutive_losses = 0  # 盈利后重置连续亏损计数
+            log.info(f"[CIRCUIT] 盈利笔: +{pnl:.2f} USDT | 连续亏损计数重置 | 当日累计: {self._daily_realized_pnl:.2f} USDT")
+
+    def tick_candle(self):
+        """
+        P2: 每根收盘K线调用一次，用于递减熔断冻结计数器。
+        在 main.py on_kline 的 is_closed 分支中调用。
+        """
+        if self._freeze_candles_remaining > 0:
+            self._freeze_candles_remaining -= 1
+            log.info(f"[CIRCUIT] 熔断冻结剩余: {self._freeze_candles_remaining} 根K线")
+
+    def _check_circuit_breaker(self, balance: float = 0.0) -> tuple:
+        """
+        P2: 熔断检查，返回 (允许交易: bool, 原因: str)
+        - 日亏损超限: 禁止
+        - 连续亏损冻结中: 禁止
+        """
+        self._reset_daily_if_needed()
+
+        # 检查K线冻结
+        if self._freeze_candles_remaining > 0:
+            return False, f"连续亏损冻结中，剩余 {self._freeze_candles_remaining} 根K线"
+
+        # 检查每日亏损限制
+        ref_balance = self._daily_start_balance if self._daily_start_balance > 0 else balance
+        if ref_balance > 0 and self._daily_realized_pnl < 0:
+            daily_loss_pct = abs(self._daily_realized_pnl) / ref_balance
+            if daily_loss_pct >= DAILY_LOSS_LIMIT:
+                return False, (f"当日亏损 {daily_loss_pct:.1%} >= 限制 {DAILY_LOSS_LIMIT:.1%} "
+                               f"({self._daily_realized_pnl:.2f} USDT)")
+
+        return True, "正常"
 
     def setup_futures(self, symbol: str):
         """设置杠杆和保证金模式"""
@@ -381,6 +457,34 @@ class BinanceTrader:
         self._notify(f"[SMC] 市价单成功：{symbol} {side.value} {quantity:.6f}，orderId={order.order_id}")
         return order
 
+    def place_limit_order(self, symbol: str, side: OrderSide,
+                          quantity: float, price: float) -> Optional[Order]:
+        """限价单（用于FVG分拆建仓第二腿）"""
+        data = self._post("/fapi/v1/order", {
+            "symbol": symbol,
+            "side": side.value,
+            "type": "LIMIT",
+            "quantity": self._fmt_qty(quantity),
+            "price": self._fmt_price(price),
+            "timeInForce": "GTC",   # Good Till Cancel
+        })
+        if not data:
+            return None
+
+        order = Order(
+            order_id=data.get("orderId", 0),
+            symbol=symbol, side=side, order_type="LIMIT",
+            quantity=quantity, stop_price=price,
+            status=OrderStatus(data.get("status", "NEW")),
+            filled_qty=float(data.get("executedQty", 0)),
+            filled_price=float(data.get("avgPrice", 0)) if data.get("avgPrice") else 0,
+            timestamp=data.get("updateTime", self._timestamp()),
+        )
+        self.orders[order.order_id] = order
+        log.info(f"[OK] 限价单: {side.value} {quantity:.6f} {symbol} @ ${price:,.2f} (orderId={order.order_id})")
+        self._notify(f"[SMC] 限价单挂出：{symbol} {side.value} {quantity:.6f} @ {price:.2f}，orderId={order.order_id}")
+        return order
+
     def place_stop_loss(self, symbol: str, side: OrderSide,
                         quantity: float, stop_price: float) -> Optional[Order]:
         """止损单"""
@@ -450,6 +554,14 @@ class BinanceTrader:
         """处理交易信号 — 完整下单流程"""
         self._notify(f"[SMC] 收到交易信号：{symbol} {signal.direction.name}，入场={signal.entry_price:.2f}，止损={signal.stop_loss:.2f}，止盈={signal.take_profit:.2f}")
 
+        # 0. P2修复: 熔断检查（日亏损/连续亏损/冻结）
+        balance_for_check = self.get_balance("USDT")
+        ok, reason = self._check_circuit_breaker(balance_for_check)
+        if not ok:
+            log.warning(f"[CIRCUIT BREAKER] 交易被熔断: {reason}")
+            self._notify(f"[SMC] 熔断触发，跳过信号: {reason}")
+            return False
+
         # 1. 检查持仓
         if self.position:
             log.warning(f"已有持仓，跳过")
@@ -477,6 +589,11 @@ class BinanceTrader:
             log.error("计算仓位为 0")
             return False
 
+        # P2: 首笔交易时记录当日起始余额（用于日亏损比例基准）
+        if self._daily_start_balance <= 0:
+            self._daily_start_balance = balance
+            log.info(f"[CIRCUIT] 当日起始余额锁定: ${self._daily_start_balance:.2f} USDT")
+
         # 4. 验证爆仓价 vs 止损价
         # 做多: 爆仓价 < 止损价 → 安全（止损先触发）
         # 做空: 爆仓价 > 止损价 → 安全（止损先触发）
@@ -499,57 +616,123 @@ class BinanceTrader:
         # 5. 合约设置
         self.setup_futures(symbol)
 
-        # 6. 下单
+        # 6. 下单（分拆建仓 或 普通整笔建仓）
         is_long = signal.direction == Bias.BULLISH
         entry_side = OrderSide.BUY if is_long else OrderSide.SELL
         close_side = OrderSide.SELL if is_long else OrderSide.BUY
 
-        entry_order = self.place_market_order(symbol, entry_side, quantity)
-        if not entry_order:
-            log.error("入场单失败")
-            self._notify(f"[SMC] 入场单失败：{symbol} {entry_side.value} {quantity:.6f}")
-            return False
+        if getattr(signal, 'split_entry', False):
+            # ── FVG 分拆建仓：30% 市价 + 70% 限价挂单 ──
+            from config import FVG_SPLIT_FIRST_RATIO
+            first_qty = quantity * FVG_SPLIT_FIRST_RATIO
+            second_qty = quantity * (1.0 - FVG_SPLIT_FIRST_RATIO)
+            second_price = signal.entry_price  # FVG 中点 = 限价单价格
 
-        sl_order = self.place_stop_loss(symbol, close_side, quantity, signal.stop_loss)
-        tp_order = self.place_take_profit(symbol, close_side, quantity, signal.take_profit)
+            entry_order = self.place_market_order(symbol, entry_side, first_qty)
+            if not entry_order:
+                log.error("[SPLIT] 30%市价单失败")
+                self._notify(f"[SMC] 分拆建仓首单失败：{symbol} {entry_side.value} {first_qty:.6f}")
+                return False
 
-        # 7. 记录持仓
-        self.position = Position(
-            symbol=symbol,
-            direction=signal.direction,
-            entry_price=signal.entry_price,
-            quantity=quantity,
-            position_size=position_size,
-            margin=margin,
-            leverage=self.config.leverage,
-            liquidation_price=liq_price,
-            entry_order_id=entry_order.order_id,
-            sl_order_id=sl_order.order_id if sl_order else 0,
-            tp_order_id=tp_order.order_id if tp_order else 0,
-            entry_time=signal.timestamp,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
-        )
+            second_order = self.place_limit_order(symbol, entry_side, second_qty, second_price)
+            if not second_order:
+                log.warning("[SPLIT] 70%限价单挂出失败，仅持有30%仓位")
+                self._notify(f"[SMC] 分拆建仓限价单失败，仅30%市价成交")
 
-        d = "做多" if is_long else "做空"
-        log.info(f"━━━ 持仓建立 ━━━")
-        log.info(f"  方向: {d} {self.config.leverage}x")
-        log.info(f"  数量: {quantity:.6f}")
-        log.info(f"  仓位: ${position_size:,.2f}")
-        log.info(f"  保证金: ${margin:,.2f}")
-        log.info(f"  入场: ${signal.entry_price:,.2f}")
-        log.info(f"  止损: ${signal.stop_loss:,.2f}")
-        log.info(f"  止盈: ${signal.take_profit:,.2f}")
-        log.info(f"  爆仓: ${liq_price:,.2f}")
-        log.info(f"━━━━━━━━━━━━━━━━")
+            # SL/TP 以完整预期数量（quantity）下单，reduceOnly 自适应实际持仓
+            sl_order = self.place_stop_loss(symbol, close_side, quantity, signal.stop_loss)
+            tp_order = self.place_take_profit(symbol, close_side, quantity, signal.take_profit)
+
+            # 7a. 记录持仓（持仓量记录为30%，split_full_qty记录完整预期）
+            self.position = Position(
+                symbol=symbol,
+                direction=signal.direction,
+                entry_price=signal.entry_price,
+                quantity=first_qty,
+                position_size=position_size * FVG_SPLIT_FIRST_RATIO,
+                margin=margin * FVG_SPLIT_FIRST_RATIO,
+                leverage=self.config.leverage,
+                liquidation_price=liq_price,
+                entry_order_id=entry_order.order_id,
+                sl_order_id=sl_order.order_id if sl_order else 0,
+                tp_order_id=tp_order.order_id if tp_order else 0,
+                entry_time=signal.timestamp,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                second_leg_order_id=second_order.order_id if second_order else 0,
+                split_full_qty=quantity,
+            )
+
+            d = "做多" if is_long else "做空"
+            fvg_mid = signal.entry_price
+            near_price = (signal.entry_top if is_long else signal.entry_bottom)
+            log.info(f"━━━ 分拆建仓 ━━━")
+            log.info(f"  方向: {d} {self.config.leverage}x")
+            log.info(f"  第一腿(30%市价): {first_qty:.6f} @ ~${near_price:,.2f}")
+            log.info(f"  第二腿(70%限价): {second_qty:.6f} @ ${fvg_mid:,.2f} [挂单中]")
+            log.info(f"  完整预期仓位: ${position_size:,.2f}")
+            log.info(f"  止损: ${signal.stop_loss:,.2f}")
+            log.info(f"  止盈: ${signal.take_profit:,.2f}")
+            log.info(f"  爆仓: ${liq_price:,.2f}")
+            log.info(f"━━━━━━━━━━━━━━━━")
+            self._notify(
+                f"[SMC] 分拆建仓 {d} {self.config.leverage}x："
+                f"30%市价({first_qty:.6f}) + 70%限价({second_qty:.6f}@{fvg_mid:.2f})，"
+                f"止损={signal.stop_loss:.2f}，止盈={signal.take_profit:.2f}"
+            )
+
+        else:
+            # ── 普通整笔建仓（原有逻辑）──
+            entry_order = self.place_market_order(symbol, entry_side, quantity)
+            if not entry_order:
+                log.error("入场单失败")
+                self._notify(f"[SMC] 入场单失败：{symbol} {entry_side.value} {quantity:.6f}")
+                return False
+
+            sl_order = self.place_stop_loss(symbol, close_side, quantity, signal.stop_loss)
+            tp_order = self.place_take_profit(symbol, close_side, quantity, signal.take_profit)
+
+            # 7b. 记录持仓
+            self.position = Position(
+                symbol=symbol,
+                direction=signal.direction,
+                entry_price=signal.entry_price,
+                quantity=quantity,
+                position_size=position_size,
+                margin=margin,
+                leverage=self.config.leverage,
+                liquidation_price=liq_price,
+                entry_order_id=entry_order.order_id,
+                sl_order_id=sl_order.order_id if sl_order else 0,
+                tp_order_id=tp_order.order_id if tp_order else 0,
+                entry_time=signal.timestamp,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+            )
+
+            d = "做多" if is_long else "做空"
+            log.info(f"━━━ 持仓建立 ━━━")
+            log.info(f"  方向: {d} {self.config.leverage}x")
+            log.info(f"  数量: {quantity:.6f}")
+            log.info(f"  仓位: ${position_size:,.2f}")
+            log.info(f"  保证金: ${margin:,.2f}")
+            log.info(f"  入场: ${signal.entry_price:,.2f}")
+            log.info(f"  止损: ${signal.stop_loss:,.2f}")
+            log.info(f"  止盈: ${signal.take_profit:,.2f}")
+            log.info(f"  爆仓: ${liq_price:,.2f}")
+            log.info(f"━━━━━━━━━━━━━━━━")
 
         return True
 
     def close_position(self, symbol: str, reason: str = "手动平仓") -> bool:
-        """平仓"""
+        """平仓（同时撤销分拆建仓的未成交第二腿限价单）"""
         if not self.position:
             return False
 
+        # 撤销分拆建仓第二腿限价单（若存在且未成交）
+        if self.position.second_leg_order_id:
+            self.cancel_order(symbol, self.position.second_leg_order_id)
+            self.position.second_leg_order_id = 0
         if self.position.sl_order_id:
             self.cancel_order(symbol, self.position.sl_order_id)
         if self.position.tp_order_id:
@@ -565,8 +748,11 @@ class BinanceTrader:
             return True
         return False
 
-    def check_position_status(self, symbol: str):
-        """检查持仓状态（止损/止盈是否已触发）"""
+    def check_position_status(self, symbol: str,
+                               high: float = 0.0,
+                               low: float = 0.0,
+                               close: float = 0.0):
+        """检查持仓状态（止损/止盈是否已触发）。high/low/close 为干跑模式兼容参数，实盘忽略。"""
         if not self.position:
             return
 
@@ -577,8 +763,18 @@ class BinanceTrader:
             }, signed=True)
             if sl and sl.get("status") == "FILLED":
                 log.info(f"🛡️ 止损已触发")
+                # P2修复: 更新每日亏损和连续亏损计数
+                if self.position:
+                    sl_pnl = (self.position.stop_loss - self.position.entry_price) * self.position.quantity
+                    if self.position.direction == Bias.BEARISH:
+                        sl_pnl = -sl_pnl
+                    self._update_pnl_tracking(sl_pnl)
                 if self.position.tp_order_id:
                     self.cancel_order(symbol, self.position.tp_order_id)
+                # 撤销分拂建仓第二腿限价单（防止平仓后限价单成交开新仓）
+                if self.position.second_leg_order_id:
+                    self.cancel_order(symbol, self.position.second_leg_order_id)
+                    log.info(f"[SPLIT] 止损触发，已撤销未成交第二腿(orderId={self.position.second_leg_order_id})")
                 self.position = None
                 return
 
@@ -589,8 +785,18 @@ class BinanceTrader:
             }, signed=True)
             if tp and tp.get("status") == "FILLED":
                 log.info(f"🎯 止盈已触发")
+                # P2修复: 止盈盈亏追踪（盈利 → 重置连续亏损计数）
+                if self.position:
+                    tp_pnl = (self.position.take_profit - self.position.entry_price) * self.position.quantity
+                    if self.position.direction == Bias.BEARISH:
+                        tp_pnl = -tp_pnl
+                    self._update_pnl_tracking(tp_pnl)
                 if self.position.sl_order_id:
                     self.cancel_order(symbol, self.position.sl_order_id)
+                # 撤销分拂建仓第二腿限价单
+                if self.position.second_leg_order_id:
+                    self.cancel_order(symbol, self.position.second_leg_order_id)
+                    log.info(f"[SPLIT] 止盈触发，已撤销未成交第二腿(orderId={self.position.second_leg_order_id})")
                 self.position = None
                 return
 
@@ -605,8 +811,9 @@ class BinanceTrader:
         lines = ["┌─── 交易状态 ───"]
         if self.position:
             d = "做多" if self.position.direction == Bias.BULLISH else "做空"
+            split_leg = f" [分拂建仓: 70%限价单#{self.position.second_leg_order_id}挂单中]" if self.position.second_leg_order_id else ""
             lines += [
-                f"│ 持仓: {d} {self.position.leverage}x {self.position.symbol}",
+                f"│ 持仓: {d} {self.position.leverage}x {self.position.symbol}{split_leg}",
                 f"│ 数量: {self.position.quantity:.6f}",
                 f"│ 仓位: ${self.position.position_size:,.2f}",
                 f"│ 保证金: ${self.position.margin:,.2f}",

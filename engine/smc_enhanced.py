@@ -55,6 +55,7 @@ class EnhancedSignal(TradeSignal):
     expected_slippage: float = 0.0      # 预期滑点
     adjusted_entry: float = 0.0         # 滑点调整后的入场价
     signal_quality_score: float = 0.0   # 信号质量评分 (0-100)
+    fvg_age: int = 0                    # P2: FVG 自生成至今已过 K 线数（越小越新鲜）
 
 
 class VolumeAnalyzer:
@@ -64,6 +65,10 @@ class VolumeAnalyzer:
         self.ma_period = ma_period
         self.volumes: List[float] = []
         self.volume_ma: float = 0.0
+        # P2修复: 缓存最近一次 update() 的结果，避免外部重复调用导致数据重复计入
+        self.last_stats: Dict[str, float] = {
+            "volume": 0.0, "volume_ma": 0.0, "volume_ratio": 1.0, "volume_trend": 0.0
+        }
 
     def update(self, volume: float) -> Dict[str, float]:
         """更新成交量数据并返回统计信息"""
@@ -89,20 +94,26 @@ class VolumeAnalyzer:
             prev_vol = sum(self.volumes[-10:-5]) / 5 if len(self.volumes) >= 10 else recent_vol
             volume_trend = (recent_vol - prev_vol) / prev_vol if prev_vol > 0 else 0.0
 
-        return {
+        stats = {
             "volume": volume,
             "volume_ma": self.volume_ma,
             "volume_ratio": volume_ratio,
             "volume_trend": volume_trend,
         }
+        self.last_stats = stats  # P2修复: 缓存结果供 confirm_breakout 复用
+        return stats
 
     def confirm_breakout(self, volume: float, price_change: float) -> Tuple[bool, str]:
         """
         确认成交量突破有效性
         返回: (是否有效, 原因)
+
+        P2修复: 不再内部调用 update()，使用调用方已更新的 last_stats，
+        避免同一K线数据被重复计入成交量均线。
         """
-        stats = self.update(volume)
-        ratio = stats["volume_ratio"]
+        # 使用已缓存的统计数据，update() 应由 _check_trade_signal 在K线收盘时调用
+        stats = self.last_stats
+        ratio = stats.get("volume_ratio", 1.0)
 
         # 检查成交量突破
         if ratio < VOLUME_BREAKOUT_RATIO:
@@ -295,56 +306,66 @@ class EnhancedSMCEngine(SMCEngine):
         self.higher_tf_candles: List[Candle] = []
         self.higher_tf_bias = Bias.NEUTRAL
 
-        # 信号质量权重
+        # 信号质量权重 (P2修复: 新增 fvg_age 维度，各权重均等)
         self.quality_weights = {
-            "volume": 0.25,
-            "mtf": 0.25,
-            "regime": 0.25,
-            "rr_ratio": 0.25,
+            "volume": 0.20,
+            "mtf": 0.20,
+            "regime": 0.20,
+            "rr_ratio": 0.20,
+            "fvg_age": 0.20,  # P2: FVG 年龄衰减权重
         }
 
     def _check_trade_signal(self, candle: Candle) -> Optional[EnhancedSignal]:
         """
         增强版交易信号检测
+
+        P2修复:
+          - 每根收盘K线都更新 VolumeAnalyzer 和 MarketRegimeDetector（而非仅有基础信号时）
+          - 使用 volume_analyzer.last_stats 替代第二次 update() 调用，彻底消除双重更新Bug
+          - 信号携带 fvg_age 供质量评分使用
         """
+        # P2修复: 每根收盘K线都更新分析器，确保MA/ADX基于全量数据而非仅信号时刻的数据
+        if candle.is_closed:
+            self.volume_analyzer.update(candle.volume)
+            prev_candle = self.candles[-2] if len(self.candles) >= 2 else None
+            self.regime_detector.update(candle, prev_candle)
+
         # 先调用父类方法获取基础信号
         base_signal = super()._check_trade_signal(candle)
         if not base_signal:
             return None
 
-        # 转换为 EnhancedSignal
+        # 转换为 EnhancedSignal，并记录 FVG 年龄
         signal = EnhancedSignal(**base_signal.__dict__)
+        signal.fvg_age = len(self.candles) - base_signal.fvg.created_bar
 
-        # 1. 市场环境检测
-        prev_candle = self.candles[-2] if len(self.candles) > 1 else None
-        regime = self.regime_detector.update(candle, prev_candle)
+        # 1. 市场环境检测（使用已预先计算的状态，无需重复调用 update()）
+        regime = self.regime_detector.current_regime
         signal.market_regime = regime
 
         should_trade, regime_reason = self.regime_detector.should_trade(signal.direction)
-        # 在数据不足时(ADX=0)允许交易，避免过滤掉所有早期信号
+        # P0修复：RANGING 不再硬过滤，改为通过质量评分降权处理（ADX=0 数据不足时直接放行）
+        # 硬过滤会在震荡市导致整个 session 零成交 —— 反而是 FVG 策略最适合的市场结构
         if not should_trade and self.regime_detector.adx_value > 0:
-            log.info(f"[FILTER] 信号过滤: {regime_reason}")
-            return None
+            log.info(f"[WARN] 震荡行情: {regime_reason}，进入严格质量验证（质量阈值不变，regime权重降至10）")
 
-        # 2. 成交量确认
+        # 2. 成交量确认（confirm_breakout 现在使用 last_stats，不再二次调用 update()）
         if VOLUME_FILTER_ENABLED:
-            # 计算价格变化
             price_change = (candle.close - candle.open) / candle.open if candle.open > 0 else 0
-
             volume_ok, volume_reason = self.volume_analyzer.confirm_breakout(
                 candle.volume, price_change
             )
             if not volume_ok:
                 log.info(f"[FILTER] 信号过滤: {volume_reason}")
                 return None
-
-            volume_stats = self.volume_analyzer.update(candle.volume)
-            signal.volume_ratio = volume_stats["volume_ratio"]
+            signal.volume_ratio = self.volume_analyzer.last_stats.get("volume_ratio", 1.0)
             log.info(f"[OK] 成交量确认: {volume_reason}")
+
+        # 获取缓存的成交量统计（已由收盘K线时预先计算，此处直接读取）
+        volume_stats = self.volume_analyzer.last_stats
 
         # 3. MTF 趋势过滤（简化实现）
         if MTF_ENABLED:
-            # 使用更长周期的趋势作为高周期趋势
             if len(self.candles) >= 100:
                 higher_tf_trend = self._calculate_higher_tf_trend()
                 signal.higher_tf_bias = higher_tf_trend
@@ -355,8 +376,7 @@ class EnhancedSMCEngine(SMCEngine):
                         return None
                     log.info(f"[OK] MTF趋势对齐: {higher_tf_trend.name}")
 
-        # 4. 计算滑点和调整入场价
-        volume_stats = self.volume_analyzer.update(candle.volume)
+        # 4. 计算滑点和调整入场价（复用已缓存的 volume_stats，无额外更新开销）
         expected_slippage = SlippageModel.calculate_slippage(
             candle, self.atr, volume_stats, regime, signal.direction
         )
@@ -369,11 +389,11 @@ class EnhancedSMCEngine(SMCEngine):
         signal.signal_quality_score = self._calculate_quality_score(signal)
 
         # 6. 质量过滤（只交易高质量信号）
-        if signal.signal_quality_score < 50:  # 从60降到50，提高交易频率
+        if signal.signal_quality_score < 50:
             log.info(f"[FILTER] 信号过滤: 质量评分过低 ({signal.signal_quality_score:.1f}/100)")
             return None
 
-        # 更新日志输出
+        # 输出增强型信号日志
         self._log_enhanced_signal(signal, regime_reason if 'regime_reason' in locals() else "")
 
         return signal
@@ -423,14 +443,17 @@ class EnhancedSMCEngine(SMCEngine):
             scores["mtf"] = 30
 
         # 市场环境评分
+        # P0修复：RANGING 降权至 10（强制其他维度高分才能过阈值），LOW_VOL 保留 50
         if signal.market_regime == MarketRegime.TRENDING_STRONG:
             scores["regime"] = 100
         elif signal.market_regime == MarketRegime.TRENDING_WEAK:
             scores["regime"] = 80
         elif signal.market_regime == MarketRegime.VOLATILE:
             scores["regime"] = 60
-        else:
-            scores["regime"] = 40
+        elif signal.market_regime == MarketRegime.LOW_VOL:
+            scores["regime"] = 50
+        else:  # RANGING
+            scores["regime"] = 10  # 最低权重：仅高质量信号（成交量+MTF+RR全优）才可通过
 
         # 盈亏比评分
         risk = abs(signal.entry_price - signal.stop_loss)
@@ -444,6 +467,17 @@ class EnhancedSMCEngine(SMCEngine):
             scores["rr_ratio"] = 60
         else:
             scores["rr_ratio"] = 40
+
+        # P2新增: FVG 年龄衰减评分 — 越新鲜的 FVG 信号可靠性越高
+        fvg_age = getattr(signal, 'fvg_age', 0)
+        if fvg_age <= 5:
+            scores["fvg_age"] = 100   # 极新鲜：结构形成后立即回踩
+        elif fvg_age <= 15:
+            scores["fvg_age"] = 75    # 较新鲜
+        elif fvg_age <= 30:
+            scores["fvg_age"] = 50    # 中等新鲜度
+        else:
+            scores["fvg_age"] = 25    # 接近 FVG_MAX_AGE，大幅降权
 
         # 加权平均
         total_score = sum(

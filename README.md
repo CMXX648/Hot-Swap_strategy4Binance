@@ -4,6 +4,14 @@
 
 ## 更新日志
 
+### v1.0.3 (2026-04-09)
+- **新增**：`exchange/dry_run_trader.py`，实现接近实盘的 Dry-Run 模拟交易模式，复用实盘下单/风控流程（含熔断、FVG 分拆建仓、钉钉推送），但不发真实委托
+- **新增**：Dry-Run 支持使用配置中的 `capital` 作为虚拟资金，启动日志与状态摘要中可直接看到虚拟余额/盈亏信息
+- **修改**：`main.py` 增加运行模式互斥校验（`--backtest` / `--live` / `--dry-run` 只能启用一个），避免模式冲突导致日志与行为混杂
+- **修改**：`main.py` 在每根收盘 K 线向交易模块传递 high/low/close，用于 Dry-Run 更准确地模拟止盈止损触发
+- **修改**：`exchange/trader.py` 的 `check_position_status()` 签名兼容 Dry-Run 接口参数，统一实盘与模拟模式调用方式
+- **修复**：`smctrade.service` 移除强制 `-l` 启动参数，改为由配置文件中的 `live/backtest/dry_run` 决定模式，修复日志文件名和模式标识显示错误（如误显示 `live`）
+
 ### v1.0.2 (2026-04-07)
 - **新增**：`exchange/binance.py` 新增 `fetch_klines_since()` 方法，支持从指定时间戳向后拉取已收盘 K 线，用于断线重连后补拉缺口
 - **新增**：`exchange/kline.py` 新增 `fill_gap()` 方法，记录最后已收盘 K 线时间戳，重连时自动补拉丢失 K 线并送入策略引擎，保持结构状态连续
@@ -124,15 +132,42 @@ STRATEGIES = {
 # 安装依赖
 pip install -r requirements.txt
 
-# ━━ 使用配置文件 ━━
-# 创建 config.json（参见下方示例），然后：
+# ━━ 推荐：使用 JSON 配置文件启动 ━━
+# 当前项目已支持 3 种运行模式：回测 / Dry-Run 模拟交易 / 实盘
+
+# 1) Dry-Run 模拟交易（推荐用于优化后的联调测试）
+# config.json 示例：
+# {
+#   "symbol": "BTCUSDT",
+#   "interval": "5m",
+#   "leverage": 50,
+#   "live": false,
+#   "backtest": false,
+#   "dry_run": true,
+#   "capital": 1000,
+#   "risk": 0.073,
+#   "fee": 0.0005,
+#   "position_size": 0,
+#   "qty": 0,
+#   "strategy": "smc-enhanced"
+# }
+python main.py --config config.json             # Dry-Run 模拟交易（读取 capital 作为虚拟资金）
+
+# 2) 回测
+# 将 config.json 中 "backtest" 设为 true
 python main.py -b --config config.json          # 回测
+
+# 3) 实盘
+# 将 config.json 中 "live" 设为 true，并提供 API Key/Secret
 python main.py -l --config config.json          # 实盘
 
 # ━━ 行情监控 ━━
-python main.py BTCUSDT                          # BTC 30m(实盘交易)
-python main.py ETHUSDT -i 1h                    # ETH 1h(实盘交易)
-python main.py BTCUSDT --dry-run                # 只分析不下单
+python main.py BTCUSDT                          # BTC 30m
+python main.py ETHUSDT -i 1h                    # ETH 1h
+
+# ━━ Dry-Run 模拟交易（CLI 直启） ━━
+python main.py BTCUSDT --dry-run --capital 1000 # 模拟交易，使用实盘风控/下单流程但不真实下单
+python main.py --config config_enhanced.json    # 按配置文件启动 Dry-Run（当前示例配置默认即为 dry_run=true）
 
 # 启用 DEBUG 日志（输出结构突破、FVG检测等详细信息）
 python main.py BTCUSDT -b --debug               # 回测并显示 DEBUG 信息
@@ -145,6 +180,12 @@ python main.py BTCUSDT -b --position-size 5000  # 每笔固定 5000 USDT
 # 回测结果导出 CSV
 python main.py BTCUSDT -b --export-csv yourfilename.csv
 python main.py BTCUSDT -b --qty 0.01 --export-csv yourfilename.csv
+
+# ━━ Dry-Run 特性 ━━
+# - 使用与实盘一致的信号处理、仓位计算、FVG 分拆建仓、熔断逻辑
+# - 每根收盘 K 线检查模拟持仓的止损/止盈
+# - 支持钉钉推送，通知标签为 [SMC-DRY]
+# - 使用 --capital 或 JSON 中的 capital 作为虚拟账户资金
 
 # ━━ 实盘交易 ━━
 export BINANCE_API_KEY="your_key"
@@ -166,7 +207,7 @@ python main.py BTCUSDT -l --position-size 5000 --api-key xxx --api-secret yyy # 
 | `-s`, `--strategy` | smc-enhanced | 策略名称（可用: smc, smc-enhanced） |
 | `--config` | 无 | JSON 配置文件路径，CLI 参数优先于配置文件 |
 | `--interval`, `-i` | 30m | K 线周期 |
-| `--dry-run`, `-d` | 关 | 只分析不下单 |
+| `--dry-run`, `-d` | 关 | Dry-Run 模拟交易模式，复用实盘下单/风控逻辑，但不真实下单 |
 | `--sl` | 1.5 | 止损 ATR 倍数 |
 | `--tp` | 3.0 | 止盈 ATR 倍数 |
 | `--swing` | 50 | 摆动结构识别窗口 |
@@ -203,31 +244,39 @@ python main.py BTCUSDT -l --position-size 5000 --api-key xxx --api-secret yyy # 
 
 ## 配置文件
 
-在config.json中配置你的交易参数
+在 config.json 中配置你的交易参数。
+
+建议通过 `live / backtest / dry_run` 三个布尔字段显式指定运行模式：
+- `backtest: true`：回测
+- `dry_run: true`：模拟交易
+- `live: true`：实盘
 
 使用 `--config` 加载 JSON 配置文件，CLI 参数优先于配置文件：
 
 ```json
 {
   "symbol": "BTCUSDT",
-  "interval": "30m",
+  "interval": "5m",
   "leverage": 50,
-  "backtest": true,
-  "candles": 2000,
-  "capital": 10000,
-  "risk": 0.02,
+  "live": false,
+  "backtest": false,
+  "dry_run": true,
+  "candles": 10000,
+  "capital": 1000,
+  "risk": 0.073,
   "fee": 0.0005,
   "position_size": 0,
   "qty": 0,
   "export_csv": "trades.csv",
-  "strategy": "smc-enhanced",  // 使用增强型策略
-  "debug": false               // 是否启用 DEBUG 日志级别
+  "strategy": "smc-enhanced",
+  "debug": false
 }
 ```
 
 ```bash
-python main.py -b --config config.json                # 全部参数来自配置
-python main.py -b --config config.json --leverage 100 # CLI 覆盖 leverage
+python main.py --config config.json                   # 按配置运行（示例为 Dry-Run）
+python main.py -b --config config.json                # CLI 覆盖为回测模式
+python main.py -l --config config.json --leverage 100 # CLI 覆盖为实盘 + 覆盖 leverage
 ```
 
 ## 历史数据管理

@@ -27,6 +27,7 @@ from strategy import STRATEGIES, create_strategy
 from exchange.kline import KlineManager
 from exchange.binance import BinanceWebSocket, BinanceREST
 from exchange.trader import BinanceTrader, TraderConfig
+from exchange.dry_run_trader import DryRunTrader
 from backtest import BacktestEngine, BacktestConfig
 
 
@@ -37,15 +38,26 @@ from backtest import BacktestEngine, BacktestConfig
 def setup_logging(log_dir: str = LOG_DIR, symbol: str = "", mode: str = "", debug: bool = False):
     """配置日志：终端 + 文件"""
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG if debug else logging.INFO)
+    # 根 logger 始终开 DEBUG，由各 handler 上的 filter 决定实际输出粒度
+    root.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
 
+    class _SignalFilter(logging.Filter):
+        """普通模式过滤器：保留 websocket DEBUG（心跳）及 INFO+ 信号事件，屏蔽其余 DEBUG 噪声。"""
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.name == "websocket":
+                return True
+            return record.levelno >= logging.INFO
+
     console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG)
     console.setFormatter(formatter)
+    if not debug:
+        console.addFilter(_SignalFilter())
     root.addHandler(console)
 
     if log_dir:
@@ -55,7 +67,10 @@ def setup_logging(log_dir: str = LOG_DIR, symbol: str = "", mode: str = "", debu
         log_file = os.path.join(log_dir, f"smc_{tag}_{ts}.log")
 
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
+        if not debug:
+            file_handler.addFilter(_SignalFilter())
         root.addHandler(file_handler)
 
         return log_file
@@ -68,30 +83,30 @@ def setup_logging(log_dir: str = LOG_DIR, symbol: str = "", mode: str = "", debu
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _CLI_TO_CONFIG_KEY = {
-    "symbol": "symbol",
-    "strategy": "strategy",
-    "interval": "interval",
-    "dry-run": "dry_run",
-    "sl": "sl",
-    "tp": "tp",
-    "swing": "swing",
-    "buffer": "buffer",
-    "leverage": "leverage",
-    "backtest": "backtest",
-    "candles": "candles",
-    "capital": "capital",
-    "risk": "risk",
-    "fee": "fee",
-    "position-size": "position_size",
-    "qty": "qty",
-    "export-csv": "export_csv",
-    "live": "live",
-    "api-key": "api_key",
-    "api-secret": "api_secret",
-    "margin-type": "margin_type",
-    "log-dir": "log_dir",
-    "config": "config",
-    "debug": "debug",
+    "symbol": "symbol", #交易对
+    "strategy": "strategy", #策略名称
+    "interval": "interval", #K线周期
+    "dry-run": "dry_run",   #仅分析不下单模式
+    "sl": "sl", #止损倍数
+    "tp": "tp", #止盈倍数
+    "swing": "swing", 
+    "buffer": "buffer", 
+    "leverage": "leverage", #杠杆
+    "backtest": "backtest", #回测模式
+    "candles": "candles", #K线数量
+    "capital": "capital", #初始资金
+    "risk": "risk", #风险比例
+    "fee": "fee", #交易手续费
+    "position-size": "position_size", #仓位大小
+    "qty": "qty", #交易数量
+    "export-csv": "export_csv", #导出 CSV
+    "live": "live", #实盘模式
+    "api-key": "api_key", #API Key
+    "api-secret": "api_secret", #API Secret
+    "margin-type": "margin_type", #保证金类型
+    "log-dir": "log_dir", #日志目录
+    "config": "config", #配置文件
+    "debug": "debug", #调试模式
 }
 
 
@@ -178,7 +193,7 @@ def on_kline(data: dict, tick_count: int):
     if tick_count % 10 == 0 or is_closed:
         direction = "[UP]" if price >= float(k["o"]) else "[DOWN]"
         status = "收盘" if is_closed else "实时"
-        log.info(
+        log.debug(
             f"{direction} [{symbol}] {interval} {status} | "
             f"O: ${float(k['o']):,.2f} H: ${float(k['h']):,.2f} "
             f"L: ${float(k['l']):,.2f} C: ${price:,.2f}"
@@ -191,11 +206,21 @@ def on_kline(data: dict, tick_count: int):
             log.info(manager.strategy.summary())
 
         if trader and signal_obj:
-            log.info("🔔 收到交易信号，提交实盘...")
+            mode_label = "🔔 [DRY-RUN] 模拟信号" if isinstance(trader, DryRunTrader) else "🔔 收到交易信号，提交实盘..."
+            log.info(mode_label)
             trader.on_signal(signal_obj, symbol)
 
-        if trader and is_closed and tick_count % 10 == 0:
-            trader.check_position_status(symbol)
+        if trader and is_closed:
+            # P2修复: 每根收盘K线即检查持仓状态（原为每10根，5m周期下50分钟滞后）
+            # 传入 candle high/low 供 DryRunTrader SL/TP 检查（实盘模式忽略）
+            trader.check_position_status(
+                symbol,
+                high=float(k['h']),
+                low=float(k['l']),
+                close=float(k['c']),
+            )
+            # P2修复: 递减熔断冻结计数器（连续亏损后的K线冻结期管理）
+            trader.tick_candle()
 
 
 def on_ws_open():
@@ -225,6 +250,10 @@ def on_ws_open():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def validate(a) -> bool:
+    enabled_modes = sum(bool(flag) for flag in (a.backtest, a.live, a.dry_run))
+    if enabled_modes > 1:
+        log.error("运行模式冲突：--backtest / --live / --dry-run 只能启用一个")
+        return False
     if a.strategy not in STRATEGIES:
         log.error(f"未知策略 '{a.strategy}'，可用: {', '.join(sorted(STRATEGIES.keys()))}")
         return False
@@ -419,7 +448,7 @@ def main():
     args = parser.parse_args()
 
     # ━━ 日志 ━━
-    mode = "backtest" if args.backtest else ("live" if args.live else "monitor")
+    mode = "backtest" if args.backtest else ("live" if args.live else ("dry_run" if args.dry_run else "monitor"))
     log_file = setup_logging(args.log_dir, args.symbol, mode, debug=args.debug)
     if log_file:
         log.info(f"📝 日志文件: {log_file}")
@@ -440,6 +469,20 @@ def main():
 
     # ━━ 构建策略 ━━
     strategy = build_strategy(args)
+
+    # ━━ Dry-Run 模拟交易模式 ━━
+    if args.dry_run:
+        trader = DryRunTrader(
+            config=TraderConfig(
+                leverage=args.leverage,
+                risk_pct=args.risk,
+                fee_rate=args.fee,
+                fixed_position_size=args.position_size,
+                fixed_qty=args.qty,
+            ),
+            initial_capital=args.capital,
+        )
+        log.info(f"[DRY-RUN] 模拟交易模式已激活，虚拟资金: ${args.capital:,.2f} USDT")
 
     # ━━ 实盘模式 ━━
     if args.live:
@@ -471,7 +514,7 @@ def main():
         buffer_size=args.buffer,
     )
 
-    mode_str = "[LIVE] 实盘交易" if args.live else ("[DRY] 干跑模式" if args.dry_run else "[MARKET] 行情模式")
+    mode_str = "[LIVE] 实盘交易" if args.live else ("[DRY] 模拟交易" if args.dry_run else "[MARKET] 行情模式")
     log.info("=" * 55)
     log.info(f"  合约交易引擎 v2.0")
     log.info("=" * 55)
@@ -485,6 +528,14 @@ def main():
         log.info(f"  摆动长度: {args.swing}")
     if args.live:
         log.info(f"  [WARN] 实盘资金将真实下单!")
+        if args.qty > 0:
+            log.info(f"  开仓数量: {args.qty} (固定)")
+        elif args.position_size > 0:
+            log.info(f"  开仓仓位: ${args.position_size:,.2f} (固定)")
+        else:
+            log.info(f"  风险/笔: {args.risk:.1%}")
+    if args.dry_run:
+        log.info(f"  虚拟资金: ${args.capital:,.2f} USDT")
         if args.qty > 0:
             log.info(f"  开仓数量: {args.qty} (固定)")
         elif args.position_size > 0:

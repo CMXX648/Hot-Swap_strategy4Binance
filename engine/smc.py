@@ -32,6 +32,7 @@ from config import (
     USE_STRUCTURE_SL, STRUCTURE_SL_BUFFER,
     TP_ADAPTIVE, TP_ADAPTIVE_LOW_VOL, TP_ADAPTIVE_HIGH_VOL,
     INTERNAL_CONFIRM, OB_SR_LOOKBACK, OB_SR_BUFFER,
+    FVG_SPLIT_ENABLED, FVG_SPLIT_THRESHOLD_ATR, FVG_SPLIT_FIRST_RATIO,
 )
 from models import (
     Bias, StructureTag, Candle, Pivot, OrderBlock,
@@ -159,6 +160,16 @@ class SMCEngine:
         else:
             # Wilder 平滑: ATR = (prev_ATR * (N-1) + TR) / N
             self.atr = (self._prev_atr * (self.atr_period - 1) + tr) / self.atr_period
+
+        # P1修复：ATR 单步跳变保护（防止 gap-fill 后一根极端 K 线导致 SL/TP 失真）
+        # 允许最大 2x 上涨 / 最小 0.5x 下跌；暖机阶段不限制
+        if self._prev_atr > 0 and bar_count > self.atr_period:
+            if self.atr > self._prev_atr * 2.0:
+                self.atr = self._prev_atr * 2.0
+                log.debug(f"[ATR] 跳变保护: 上限 {self.atr:.2f}")
+            elif self.atr < self._prev_atr * 0.5:
+                self.atr = self._prev_atr * 0.5
+                log.debug(f"[ATR] 跳变保护: 下限 {self.atr:.2f}")
 
         self._prev_atr = self.atr
 
@@ -302,8 +313,8 @@ class SMCEngine:
 
         prefix = "[UP]" if is_bullish else "[DOWN]"
         scope = "Internal" if internal else "Swing"
-        log.debug(f"{prefix} {scope} {tag.value} {'看涨' if is_bullish else '看跌'} | "
-                  f"{'突破' if is_bullish else '跌破'} ${pivot.current_level:,.2f} → 收盘 ${close_price:,.2f}")
+        log.info(f"{prefix} {scope} {tag.value} {'看涨' if is_bullish else '看跌'} | "
+                 f"{'突破' if is_bullish else '跌破'} ${pivot.current_level:,.2f} → 收盘 ${close_price:,.2f}")
 
         self._store_order_block(pivot, internal, break_bias)
 
@@ -398,7 +409,7 @@ class SMCEngine:
                     top=k0.low, bottom=k2.high, bias=Bias.BULLISH,
                     left_time=k2.open_time, created_bar=len(self.candles),
                 ))
-                log.debug(f"[BULL] FVG 看涨 | ${k2.high:,.2f} → ${k0.low:,.2f} (gap={gap:,.2f})")
+                log.info(f"[BULL] FVG 看涨 | ${k2.high:,.2f} → ${k0.low:,.2f} (gap={gap:,.2f})")
 
         if k0.high < k2.low:
             gap = k2.low - k0.high
@@ -407,7 +418,7 @@ class SMCEngine:
                     top=k2.low, bottom=k0.high, bias=Bias.BEARISH,
                     left_time=k2.open_time, created_bar=len(self.candles),
                 ))
-                log.debug(f"[BEAR] FVG 看跌 | ${k0.high:,.2f} → ${k2.low:,.2f} (gap={gap:,.2f})")
+                log.info(f"[BEAR] FVG 看跌 | ${k0.high:,.2f} → ${k2.low:,.2f} (gap={gap:,.2f})")
 
     # ━━━ EQH / EQL ━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -469,10 +480,8 @@ class SMCEngine:
         self._delete_order_blocks(internal=False)
         self._update_trailing(candle)
 
-        if candle.is_closed:
-            return self._check_trade_signal(candle)
-
-        return None
+        # 每次 tick 都检测入场：FVG 形成后，实时价格首次回落/反弹至中点即触发
+        return self._check_trade_signal(candle)
 
     # ━━━ OB 支撑/阻力查找 ━━━━━━━━━━━━━━━━━━━━
 
@@ -527,8 +536,8 @@ class SMCEngine:
         条件：
           - swing_trend != NEUTRAL
           - （可选）internal_trend == swing_trend（双周期共振）
-          - 存在与趋势同向的未缓解 FVG（未过期）
-          - 价格回踩/反弹到 FVG 区间
+          - 存在与趋势同向的未缓解且未触发的 FVG（未过期）
+          - 实时价格首次回落/反弹到 FVG 中点位置（即时触发，不等待 K 线收盘）
 
         止损策略：
           - 纯 ATR：FVG 边界 ± ATR × sl_mult
@@ -552,19 +561,63 @@ class SMCEngine:
 
         current_bar = len(self.candles)
         matching_fvg = None
+        is_split_entry = False
+        current_price = candle.close  # 实时价格（WebSocket tick 最新成交价）
 
         for fvg in self.fvgs:
             if fvg.bias != trend:
                 continue
-
+            if fvg.triggered:  # 已触发，跳过（避免同一 FVG 重复下单）
+                continue
             # FVG 过期检查
             if current_bar - fvg.created_bar > FVG_MAX_AGE:
                 continue
 
-            if trend == Bias.BULLISH and candle.low > fvg.bottom:
+            fvg_mid = (fvg.top + fvg.bottom) / 2
+            fvg_size = fvg.top - fvg.bottom
+
+            # ── FVG 分拆检测：大FVG在近端（顶/底）即触发30%市价 + 70%限价挂单 ──
+            # 近端区间定义：
+            #   看涨FVG: 价格从上方回踩，先进入上半区 (fvg_mid < price <= fvg.top)
+            #   看跌FVG: 价格从下方反弹，先进入下半区 (fvg.bottom <= price < fvg_mid)
+            if FVG_SPLIT_ENABLED and fvg_size >= self.atr * FVG_SPLIT_THRESHOLD_ATR:
+                if candle.is_closed:
+                    early_bull = (fvg_mid < candle.close <= fvg.top or
+                                  (candle.low <= fvg.top and candle.close >= fvg_mid))
+                    early_bear = (fvg.bottom <= candle.close < fvg_mid or
+                                  (candle.high >= fvg.bottom and candle.close <= fvg_mid))
+                else:
+                    early_bull = fvg_mid < current_price <= fvg.top
+                    early_bear = fvg.bottom <= current_price < fvg_mid
+
+                if trend == Bias.BULLISH and early_bull:
+                    matching_fvg = fvg
+                    is_split_entry = True
+                    break
+                elif trend == Bias.BEARISH and early_bear:
+                    matching_fvg = fvg
+                    is_split_entry = True
+                    break
+
+            # P1修复：已收盘 K 线用 low/high 判断是否扫过 FVG 中点（捕获插针入场）
+            # 实时 tick（is_closed=False）仍用 close（即当前价）
+            if candle.is_closed:
+                # 看涨 FVG：收盘价未进入但最低价扫过中点 → 插针入场确认
+                bull_zone = (fvg.bottom <= candle.close <= fvg_mid or
+                             (candle.low <= fvg_mid and candle.close >= fvg.bottom))
+                # 看跌 FVG：收盘价未进入但最高价扫过中点
+                bear_zone = (fvg_mid <= candle.close <= fvg.top or
+                             (candle.high >= fvg_mid and candle.close <= fvg.top))
+            else:
+                bull_zone = fvg.bottom <= current_price <= fvg_mid
+                bear_zone = fvg_mid <= current_price <= fvg.top
+
+            # 看涨 FVG：等待价格向下回踩至 FVG 中点（从上方进入）
+            if trend == Bias.BULLISH and bull_zone:
                 matching_fvg = fvg
                 break
-            elif trend == Bias.BEARISH and candle.high < fvg.top:
+            # 看跌 FVG：等待价格向上反弹至 FVG 中点（从下方进入）
+            elif trend == Bias.BEARISH and bear_zone:
                 matching_fvg = fvg
                 break
 
@@ -588,9 +641,6 @@ class SMCEngine:
         resistance_ob = None
 
         if trend == Bias.BULLISH:
-            if not (matching_fvg.bottom <= candle.low <= matching_fvg.top * 1.005):
-                return None
-
             # 基础止损：结构 or 纯 ATR
             if self.use_structure_sl and self.swing_low.current_level > 0:
                 sl_structure = self.swing_low.current_level - self.atr * STRUCTURE_SL_BUFFER
@@ -637,9 +687,6 @@ class SMCEngine:
                 tp_type = f"ATR×{tp_mult:.1f}"
 
         else:  # BEARISH
-            if not (matching_fvg.bottom * 0.995 <= candle.high <= matching_fvg.top):
-                return None
-
             # 基础止损
             if self.use_structure_sl and self.swing_high.current_level > 0:
                 sl_structure = self.swing_high.current_level + self.atr * STRUCTURE_SL_BUFFER
@@ -702,17 +749,22 @@ class SMCEngine:
             stop_loss=stop_loss, take_profit=take_profit,
             atr=self.atr, fvg=matching_fvg,
             structure=recent[-1], timestamp=candle.open_time,
+            split_entry=is_split_entry,
         )
 
         d = "做多" if trend == Bias.BULLISH else "做空"
-        # 格式化 K 线时间
+        fvg_mid = (matching_fvg.top + matching_fvg.bottom) / 2
+        # 格式化实时时间
         from datetime import datetime, timezone, timedelta
-        utc_dt = datetime.fromtimestamp(candle.open_time/1000, tz=timezone.utc)
-        local_dt = utc_dt + timedelta(hours=8)
-        candle_time = local_dt.strftime("%Y-%m-%d %H:%M")
-        log.info(f"=== 交易信号 === [K线时间: {candle_time}]")
+        now_dt = datetime.now(tz=timezone(timedelta(hours=8)))
+        trigger_time = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        split_tag = f" [分拆建仓: 30%市价@近端 + 70%限价@{entry_price:,.2f}]" if is_split_entry else ""
+        log.info(f"=== 交易信号{split_tag} === [实时触发: {trigger_time}]")
         log.info(f"  方向: {d}")
-        log.info(f"  入场: ${entry_price:,.2f} (FVG ${matching_fvg.bottom:,.2f}-${matching_fvg.top:,.2f})")
+        log.info(f"  触发价: ${current_price:,.2f} | FVG 中点: ${fvg_mid:,.2f}")
+        log.info(f"  FVG 区间: ${matching_fvg.bottom:,.2f} → ${matching_fvg.top:,.2f}"
+                 + (f" | FVG高度: ${matching_fvg.top - matching_fvg.bottom:,.2f} (ATR×{(matching_fvg.top - matching_fvg.bottom)/self.atr:.1f})" if is_split_entry else ""))
+        log.info(f"  入场: ${entry_price:,.2f}" + (" (FVG中点，70%限价)" if is_split_entry else ""))
         log.info(f"  止损: ${stop_loss:,.2f} ({sl_type})")
         log.info(f"  止盈: ${take_profit:,.2f} ({tp_type})")
         log.info(f"  盈亏比: {rr_ratio:.2f} | ATR: ${self.atr:,.2f}")
@@ -722,6 +774,9 @@ class SMCEngine:
             log.info(f"  阻力OB: ${resistance_ob.bar_low:,.2f}-${resistance_ob.bar_high:,.2f}")
         log.info(f"  趋势依据: {recent[-1].tag.value} @ ${recent[-1].level:,.2f}")
         log.info(f"================")
+
+        # 标记该 FVG 已触发，避免在同一 FVG 区间内重复发出信号
+        matching_fvg.triggered = True
 
         return signal
 
@@ -756,3 +811,20 @@ class SMCEngine:
                 lines.append(f"  {d} ${fvg.bottom:,.2f} → ${fvg.top:,.2f}")
 
         return "\n".join(lines)
+
+    # ━━━ 工具方法 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def reset_fvg_triggered(self):
+        """
+        P0修复：重置所有 FVG 的触发标志。
+
+        历史预热和断线重连 gap-fill 会在回放过程中将 FVG.triggered 设为 True，
+        导致这些 FVG 在实盘中永久失效。每次历史加载或 gap-fill 结束后调用此方法，
+        确保 FVG 池对实盘信号完全可用。
+        """
+        reset_count = sum(1 for fvg in self.fvgs if fvg.triggered)
+        for fvg in self.fvgs:
+            fvg.triggered = False
+        if reset_count:
+            log.info(f"[FVG RESET] 已重置 {reset_count} 个 FVG 触发标志，"
+                     f"共 {len(self.fvgs)} 个 FVG 可用于实盘")

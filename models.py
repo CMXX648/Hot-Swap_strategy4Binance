@@ -83,12 +83,14 @@ class FVGBox:
       field bias      方向
       field left_time 形成时间
       created_bar     形成时的 K 线索引
+      triggered       是否已触发过入场（避免同一 FVG 重复下单）
     """
     top: float
     bottom: float
     bias: Bias
     left_time: int
     created_bar: int
+    triggered: bool = False
 
 
 @dataclass
@@ -112,7 +114,7 @@ class TradeSignal:
     由策略引擎在趋势 + FVG + ATR 条件同时满足时生成
     """
     direction: Bias
-    entry_price: float      # FVG 区间中点
+    entry_price: float      # FVG 区间中点（也是分拆建仓时第二腿的限价价格）
     entry_top: float        # FVG 上沿
     entry_bottom: float     # FVG 下沿
     stop_loss: float        # 止损价
@@ -121,3 +123,4 @@ class TradeSignal:
     fvg: FVGBox             # 触发的 FVG
     structure: StructureEvent  # 趋势依据
     timestamp: int          # 信号时间
+    split_entry: bool = False   # 是否为 FVG 分拆建仓信号（大FVG近端触发）

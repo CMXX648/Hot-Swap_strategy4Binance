@@ -48,6 +48,11 @@ class KlineManager:
             self._bar_count += 1
             self._last_closed_time = candle.open_time
 
+        # P0修复：历史预热会将回放过程中命中的 FVG 标记为 triggered，
+        # 导致实盘永远无法使用这些 FVG。加载完成后统一重置触发标志。
+        if hasattr(self.strategy, 'engine'):
+            self.strategy.engine.reset_fvg_triggered()
+
         return len(candles)
 
     def fill_gap(self) -> int:
@@ -84,6 +89,9 @@ class KlineManager:
 
         if count:
             log.info(f"[GAP FILL] 补拉 {count} 根缺失 K 线，最新: {self._last_closed_time}")
+            # P0修复：gap-fill 回放同样会污染 FVG 触发标志，重置后实盘信号才能正常触发
+            if hasattr(self.strategy, 'engine'):
+                self.strategy.engine.reset_fvg_triggered()
         else:
             log.info("[GAP FILL] 无缺口，结构连续")
 
