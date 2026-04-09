@@ -11,5 +11,5 @@
   "position_size": 0,
   "qty": 0,
   "export_csv": "trades_enhanced.csv",
-  "strategy": "smc-enhanced"
+  "strategy": "smc"
 }

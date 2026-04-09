@@ -2,6 +2,7 @@
   "symbol": "BTCUSDT",
   "interval": "5m",
   "leverage": 50,
+  "live": false,
   "backtest": false,
   "dry_run": true,
   "candles": 10000,

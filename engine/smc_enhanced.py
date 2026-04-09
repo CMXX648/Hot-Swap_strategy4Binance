@@ -330,8 +330,18 @@ class EnhancedSMCEngine(SMCEngine):
             prev_candle = self.candles[-2] if len(self.candles) >= 2 else None
             self.regime_detector.update(candle, prev_candle)
 
+        # ── 动态 R:R 阈值：MTF 高度共振时允许 1.0, 否则要求 1.5 ──
+        # 提前计算 MTF 趋势，用于在 super() 调用前设置 rr_min，
+        # 使基础引擎的 R:R 过滤能感知高级别趋势对齐情况
+        if MTF_ENABLED and len(self.candles) >= 100:
+            _htf = self._calculate_higher_tf_trend()
+            self.rr_min = 1.0 if (_htf != Bias.NEUTRAL) else 1.5
+        else:
+            self.rr_min = 1.5
+
         # 先调用父类方法获取基础信号
         base_signal = super()._check_trade_signal(candle)
+        self.rr_min = 1.5  # 恢复默认阈值（避免状态残留）
         if not base_signal:
             return None
 

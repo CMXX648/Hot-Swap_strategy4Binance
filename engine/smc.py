@@ -89,6 +89,9 @@ class SMCEngine:
         self.internal_confirm = internal_confirm
         self.ob_sr_lookback = ob_sr_lookback
 
+        # ── R:R 最小阈值（增强引擎可在调用前动态覆盖，基础引擎固定 1.5）──
+        self.rr_min: float = 1.5
+
         # ── 摆动结构状态 ──
         self.swing_high = Pivot()
         self.swing_low  = Pivot()
@@ -582,8 +585,7 @@ class SMCEngine:
             #   看跌FVG: 价格从下方反弹，先进入下半区 (fvg.bottom <= price < fvg_mid)
             if FVG_SPLIT_ENABLED and fvg_size >= self.atr * FVG_SPLIT_THRESHOLD_ATR:
                 if candle.is_closed:
-                    early_bull = (fvg_mid < candle.close <= fvg.top or
-                                  (candle.low <= fvg.top and candle.close >= fvg_mid))
+                    early_bull = fvg_mid < candle.close <= fvg.top
                     early_bear = (fvg.bottom <= candle.close < fvg_mid or
                                   (candle.high >= fvg.bottom and candle.close <= fvg_mid))
                 else:
@@ -735,13 +737,23 @@ class SMCEngine:
         reward = abs(take_profit - entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
 
-        if rr_ratio < 1.0:
-            log.debug(f"盈亏比 {rr_ratio:.2f} < 1.0，跳过信号")
+        if rr_ratio < self.rr_min:
+            log.debug(f"盈亏比 {rr_ratio:.2f} < {self.rr_min:.1f}，跳过信号")
             return None
 
         recent = [e for e in self.structure_events if e.bias == trend]
         if not recent:
             return None
+
+        # ── 分拆建仓限价单价格：FVG 远端内侧（中点向远端偏移 20% × 高度）──
+        # 看涨: 远端 = bottom，限价 = midpoint - 20% × size (更深回踩)
+        # 看跌: 远端 = top，  限价 = midpoint + 20% × size (更浅反弹)
+        fvg_mid = (matching_fvg.top + matching_fvg.bottom) / 2
+        fvg_size_val = matching_fvg.top - matching_fvg.bottom
+        if trend == Bias.BULLISH:
+            split_limit_price = fvg_mid - 0.20 * fvg_size_val
+        else:
+            split_limit_price = fvg_mid + 0.20 * fvg_size_val
 
         signal = TradeSignal(
             direction=trend, entry_price=entry_price,
@@ -750,15 +762,16 @@ class SMCEngine:
             atr=self.atr, fvg=matching_fvg,
             structure=recent[-1], timestamp=candle.open_time,
             split_entry=is_split_entry,
+            split_limit_price=split_limit_price,
         )
 
         d = "做多" if trend == Bias.BULLISH else "做空"
-        fvg_mid = (matching_fvg.top + matching_fvg.bottom) / 2
+        # fvg_mid already computed above
         # 格式化实时时间
         from datetime import datetime, timezone, timedelta
         now_dt = datetime.now(tz=timezone(timedelta(hours=8)))
         trigger_time = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-        split_tag = f" [分拆建仓: 30%市价@近端 + 70%限价@{entry_price:,.2f}]" if is_split_entry else ""
+        split_tag = f" [分拆建仓: 30%市价@近端 + 70%限价@{split_limit_price:,.2f}]" if is_split_entry else ""
         log.info(f"=== 交易信号{split_tag} === [实时触发: {trigger_time}]")
         log.info(f"  方向: {d}")
         log.info(f"  触发价: ${current_price:,.2f} | FVG 中点: ${fvg_mid:,.2f}")

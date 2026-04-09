@@ -212,13 +212,24 @@ def on_kline(data: dict, tick_count: int):
 
         if trader and is_closed:
             # P2修复: 每根收盘K线即检查持仓状态（原为每10根，5m周期下50分钟滞后）
-            # 传入 candle high/low 供 DryRunTrader SL/TP 检查（实盘模式忽略）
+            # 传入 candle high/low/open 供 DryRunTrader SL/TP 及第二腿取消条件检查（实盘模式忽略）
             trader.check_position_status(
                 symbol,
                 high=float(k['h']),
                 low=float(k['l']),
                 close=float(k['c']),
+                open_price=float(k['o']),
             )
+
+            # 条件3: 同向 BOS/CHoCH 确认 → 取消第二腿限价挂单
+            if hasattr(trader, 'on_bos_choch') and hasattr(manager, 'strategy'):
+                engine = getattr(manager.strategy, 'engine', None)
+                if engine and engine.structure_events:
+                    latest_evt = engine.structure_events[-1]
+                    current_bar_idx = len(engine.candles) - 1
+                    if latest_evt.bar_index == current_bar_idx:
+                        trader.on_bos_choch(symbol, latest_evt.bias)
+
             # P2修复: 递减熔断冻结计数器（连续亏损后的K线冻结期管理）
             trader.tick_candle()
 

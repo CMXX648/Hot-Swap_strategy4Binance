@@ -124,3 +124,4 @@ class TradeSignal:
     structure: StructureEvent  # 趋势依据
     timestamp: int          # 信号时间
     split_entry: bool = False   # 是否为 FVG 分拆建仓信号（大FVG近端触发）
+    split_limit_price: float = 0.0  # 分拆建仓第二腿限价单价格（FVG远端内侧，中点±20%偏移）

@@ -117,6 +117,8 @@ class Position:
     take_profit: float = 0.0
     second_leg_order_id: int = 0   # FVG分拆建仓: 70%限价单的orderId（0=无挂单）
     split_full_qty: float = 0.0    # FVG分拆建仓: 完整预期数量（用于SL/TP订单的数量）
+    split_fvg_top: float = 0.0     # FVG分拆建仓: FVG上沿（用于第二腿取消条件）
+    split_fvg_bottom: float = 0.0  # FVG分拆建仓: FVG下沿
 
 
 @dataclass
@@ -159,6 +161,7 @@ class BinanceTrader:
         self._daily_realized_pnl: float = 0.0    # 当日已实现盈亏（USDT）
         self._consecutive_losses: int = 0         # 连续亏损次数
         self._freeze_candles_remaining: int = 0   # 熔断后剩余冻结K线数
+        self._split_leg_bars: int = 0             # 分拆建仓第二腿已等待K线数
 
     def _notify(self, message: str) -> None:
         """通过钉钉机器人发送实时提醒。"""
@@ -297,6 +300,8 @@ class BinanceTrader:
         if self._freeze_candles_remaining > 0:
             self._freeze_candles_remaining -= 1
             log.info(f"[CIRCUIT] 熔断冻结剩余: {self._freeze_candles_remaining} 根K线")
+        if self.position and self.position.second_leg_order_id:
+            self._split_leg_bars += 1
 
     def _check_circuit_breaker(self, balance: float = 0.0) -> tuple:
         """
@@ -626,7 +631,7 @@ class BinanceTrader:
             from config import FVG_SPLIT_FIRST_RATIO
             first_qty = quantity * FVG_SPLIT_FIRST_RATIO
             second_qty = quantity * (1.0 - FVG_SPLIT_FIRST_RATIO)
-            second_price = signal.entry_price  # FVG 中点 = 限价单价格
+            second_price = signal.split_limit_price if signal.split_limit_price > 0 else signal.entry_price
 
             entry_order = self.place_market_order(symbol, entry_side, first_qty)
             if not entry_order:
@@ -661,6 +666,8 @@ class BinanceTrader:
                 take_profit=signal.take_profit,
                 second_leg_order_id=second_order.order_id if second_order else 0,
                 split_full_qty=quantity,
+                split_fvg_top=signal.entry_top,
+                split_fvg_bottom=signal.entry_bottom,
             )
 
             d = "做多" if is_long else "做空"
@@ -669,7 +676,7 @@ class BinanceTrader:
             log.info(f"━━━ 分拆建仓 ━━━")
             log.info(f"  方向: {d} {self.config.leverage}x")
             log.info(f"  第一腿(30%市价): {first_qty:.6f} @ ~${near_price:,.2f}")
-            log.info(f"  第二腿(70%限价): {second_qty:.6f} @ ${fvg_mid:,.2f} [挂单中]")
+            log.info(f"  第二腿(70%限价): {second_qty:.6f} @ ${second_price:,.2f} [挂单中]")
             log.info(f"  完整预期仓位: ${position_size:,.2f}")
             log.info(f"  止损: ${signal.stop_loss:,.2f}")
             log.info(f"  止盈: ${signal.take_profit:,.2f}")
@@ -677,9 +684,10 @@ class BinanceTrader:
             log.info(f"━━━━━━━━━━━━━━━━")
             self._notify(
                 f"[SMC] 分拆建仓 {d} {self.config.leverage}x："
-                f"30%市价({first_qty:.6f}) + 70%限价({second_qty:.6f}@{fvg_mid:.2f})，"
+                f"30%市价({first_qty:.6f}) + 70%限价({second_qty:.6f}@{second_price:.2f})，"
                 f"止损={signal.stop_loss:.2f}，止盈={signal.take_profit:.2f}"
             )
+            self._split_leg_bars = 0  # 重置等待计数
 
         else:
             # ── 普通整笔建仓（原有逻辑）──
@@ -751,7 +759,8 @@ class BinanceTrader:
     def check_position_status(self, symbol: str,
                                high: float = 0.0,
                                low: float = 0.0,
-                               close: float = 0.0):
+                               close: float = 0.0,
+                               open_price: float = 0.0):
         """检查持仓状态（止损/止盈是否已触发）。high/low/close 为干跑模式兼容参数，实盘忽略。"""
         if not self.position:
             return
@@ -775,6 +784,7 @@ class BinanceTrader:
                 if self.position.second_leg_order_id:
                     self.cancel_order(symbol, self.position.second_leg_order_id)
                     log.info(f"[SPLIT] 止损触发，已撤销未成交第二腿(orderId={self.position.second_leg_order_id})")
+                self._split_leg_bars = 0
                 self.position = None
                 return
 
@@ -797,8 +807,28 @@ class BinanceTrader:
                 if self.position.second_leg_order_id:
                     self.cancel_order(symbol, self.position.second_leg_order_id)
                     log.info(f"[SPLIT] 止盈触发，已撤销未成交第二腿(orderId={self.position.second_leg_order_id})")
+                self._split_leg_bars = 0
                 self.position = None
                 return
+
+        # ── 第二腿挂单取消条件检查 ──
+        if self.position and self.position.second_leg_order_id:
+            from config import FVG_MAX_AGE
+            pos = self.position
+            cancel_reason = None
+            # 条件1: 实体收盘离开 FVG 区间（close 超出 fvg 上沿或下沿）
+            if close > 0 and pos.split_fvg_top > 0:
+                if close > pos.split_fvg_top or close < pos.split_fvg_bottom:
+                    cancel_reason = f"价格实体收盘离开FVG区间(close={close:.2f}, fvg=[{pos.split_fvg_bottom:.2f},{pos.split_fvg_top:.2f}])"
+            # 条件2: FVG 达到 FVG_MAX_AGE 过期
+            if cancel_reason is None and self._split_leg_bars >= FVG_MAX_AGE:
+                cancel_reason = f"第二腿等待超过 FVG_MAX_AGE({FVG_MAX_AGE}根K线)"
+            if cancel_reason:
+                self.cancel_order(symbol, pos.second_leg_order_id)
+                pos.second_leg_order_id = 0
+                self._split_leg_bars = 0
+                log.info(f"[SPLIT] 第二腿限价单已撤销: {cancel_reason}")
+                self._notify(f"[SMC] 分拆建仓第二腿撤销: {cancel_reason}")
 
         # 超时平仓
         if self.config.max_position_age > 0:
@@ -806,6 +836,18 @@ class BinanceTrader:
             if age > self.config.max_position_age:
                 log.info(f"⏰ 持仓超时 ({age:.0f}s)")
                 self.close_position(symbol, "超时平仓")
+
+    def on_bos_choch(self, symbol: str, bias) -> None:
+        """条件3: 同向 BOS/CHoCH 已确认时，取消第二腿限价挂单（无需更深回踩）"""
+        if not self.position or not self.position.second_leg_order_id:
+            return
+        if self.position.direction != bias:
+            return
+        self.cancel_order(symbol, self.position.second_leg_order_id)
+        self.position.second_leg_order_id = 0
+        self._split_leg_bars = 0
+        log.info(f"[SPLIT] 同向BOS/CHoCH确认，第二腿限价单已撤销")
+        self._notify(f"[SMC] 分拆建仓第二腿撤销: 同向BOS/CHoCH确认，无需继续等待回踩")
 
     def summary(self) -> str:
         lines = ["┌─── 交易状态 ───"]

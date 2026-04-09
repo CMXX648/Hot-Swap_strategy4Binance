@@ -1,19 +1,19 @@
 [Unit]
-Description=SMC Log Web Viewer Service
-After=network-online.target
+Description=SMC Binance Futures Trading Service
+After=network-online.target mihomo.service smclogweb.service
 Wants=network-online.target
-PartOf=smctrade.service
+Requires=mihomo.service
+Wants=smclogweb.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/ubuntu/strategy
 EnvironmentFile=-/home/ubuntu/strategy/smctrade.env
-# Optional: set token in env file, e.g. LOG_WEB_TOKEN=your_token
-ExecStart=/home/ubuntu/strategy/venv/bin/python /home/ubuntu/strategy/log_web.py --host 0.0.0.0 --port 8080 --log-file /home/ubuntu/strategy/logs/smctrade-service.log
+ExecStart=/home/ubuntu/strategy/venv/bin/python /home/ubuntu/strategy/main.py --config /home/ubuntu/strategy/config_enhanced.json
 Restart=always
-RestartSec=3
-StandardOutput=append:/home/ubuntu/strategy/logs/smclogweb-service.log
-StandardError=append:/home/ubuntu/strategy/logs/smclogweb-service.log
+RestartSec=5
+StandardOutput=append:/home/ubuntu/strategy/logs/smctrade-service.log
+StandardError=append:/home/ubuntu/strategy/logs/smctrade-service.log
 
 [Install]
 WantedBy=multi-user.target

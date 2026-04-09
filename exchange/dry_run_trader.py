@@ -51,8 +51,10 @@ class DryRunTrader:
 
         # ── 分拆建仓虚拟挂单追踪 ──
         self._second_leg_qty: float = 0.0    # 70% 待成交数量
-        self._second_leg_price: float = 0.0  # 70% 限价价格（FVG 中点）
+        self._second_leg_price: float = 0.0  # 70% 限价价格（FVG 远端内侧）
         self._avg_entry_price: float = 0.0   # 加权平均入场价（用于 P&L 计算）
+        self._split_leg_bars: int = 0        # 第二腿已等待K线数
+        self._split_leg_bars: int = 0        # 第二腿已等待K线数
 
         # ── 统计 ──
         self._total_trades: int = 0
@@ -203,6 +205,10 @@ class DryRunTrader:
         if self._freeze_candles_remaining > 0:
             self._freeze_candles_remaining -= 1
             log.info(f"[DRY-RUN][CIRCUIT] 熔断冻结剩余: {self._freeze_candles_remaining} 根K线")
+        if self.position and self.position.second_leg_order_id:
+            self._split_leg_bars += 1
+        if self.position and self.position.second_leg_order_id:
+            self._split_leg_bars += 1
 
     # ━━━ 核心逻辑 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -259,7 +265,7 @@ class DryRunTrader:
             second_qty = quantity * (1.0 - FVG_SPLIT_FIRST_RATIO)
             # 30% 近端市价：做多用 FVG 顶（proximal），做空用 FVG 底
             first_price = signal.entry_top if is_long else signal.entry_bottom
-            second_price = signal.entry_price  # FVG 中点 = 限价单价格
+            second_price = signal.split_limit_price if signal.split_limit_price > 0 else signal.entry_price
 
             margin_first = (first_qty * first_price) / self.config.leverage
             self.balance -= margin_first
@@ -267,6 +273,8 @@ class DryRunTrader:
             self._second_leg_qty = second_qty
             self._second_leg_price = second_price
             self._avg_entry_price = first_price  # 初始平均入场 = 首单价格
+            self._split_leg_bars = 0  # 重置等待计数
+            self._split_leg_bars = 0  # 重置等待计数
 
             self.position = Position(
                 symbol=symbol,
@@ -285,6 +293,10 @@ class DryRunTrader:
                 take_profit=signal.take_profit,
                 second_leg_order_id=1,      # 非0表示虚拟限价挂单中
                 split_full_qty=quantity,
+                split_fvg_top=signal.entry_top,
+                split_fvg_bottom=signal.entry_bottom,
+                split_fvg_top=signal.entry_top,
+                split_fvg_bottom=signal.entry_bottom,
             )
 
             log.info(f"━━━ [DRY-RUN] 分拆建仓模拟 ━━━")
@@ -346,7 +358,8 @@ class DryRunTrader:
     def check_position_status(self, symbol: str,
                                high: float = 0.0,
                                low: float = 0.0,
-                               close: float = 0.0):
+                               close: float = 0.0,
+                               open_price: float = 0.0):
         """
         检查虚拟持仓 SL/TP 是否被当根K线触发。
 
@@ -424,6 +437,7 @@ class DryRunTrader:
             )
             self.position = None
             self._second_leg_qty = 0.0
+            self._split_leg_bars = 0
             return
 
         if tp_hit:
@@ -442,6 +456,41 @@ class DryRunTrader:
             )
             self.position = None
             self._second_leg_qty = 0.0
+            self._split_leg_bars = 0
+            return
+
+        # ── 第二腿挂单取消条件检查（仅 SL/TP 未触发时执行）──
+        if pos.second_leg_order_id and self._second_leg_qty > 0:
+            from config import FVG_MAX_AGE
+            cancel_reason = None
+            # 条件1: 实体收盘离开 FVG 区间
+            if close > 0 and pos.split_fvg_top > 0:
+                if close > pos.split_fvg_top or close < pos.split_fvg_bottom:
+                    cancel_reason = (
+                        f"价格实体收盘离开FVG(close={close:.2f}, "
+                        f"fvg=[{pos.split_fvg_bottom:.2f},{pos.split_fvg_top:.2f}])"
+                    )
+            # 条件2: 第二腿等待超过 FVG_MAX_AGE
+            if cancel_reason is None and self._split_leg_bars >= FVG_MAX_AGE:
+                cancel_reason = f"第二腿等待超过 FVG_MAX_AGE({FVG_MAX_AGE}根K线)"
+            if cancel_reason:
+                pos.second_leg_order_id = 0
+                self._second_leg_qty = 0.0
+                self._split_leg_bars = 0
+                log.info(f"[DRY-RUN][SPLIT] 第二腿虚拟挂单已撤销: {cancel_reason}")
+                self._notify(f"[SMC-DRY] 分拆建仓第二腿撤销: {cancel_reason}")
+
+    def on_bos_choch(self, symbol: str, bias) -> None:
+        """条件3: 同向 BOS/CHoCH 确认，取消第二腿虚拟挂单（无需更深回踩）"""
+        if not self.position or not self.position.second_leg_order_id:
+            return
+        if self.position.direction != bias:
+            return
+        self.position.second_leg_order_id = 0
+        self._second_leg_qty = 0.0
+        self._split_leg_bars = 0
+        log.info(f"[DRY-RUN][SPLIT] 同向BOS/CHoCH确认，第二腿虚拟挂单已撤销")
+        self._notify(f"[SMC-DRY] 分拆建仓第二腿撤销: 同向BOS/CHoCH确认，无需继续等待回踩")
 
     def _calc_pnl(self, pos: Position, close_price: float) -> float:
         """计算虚拟持仓的盈亏（使用实际加权平均入场价，含双向手续费）"""
