@@ -12,12 +12,14 @@ strategy 包 — 策略注册表
 from .base import BaseStrategy
 from .smc import SMCStrategy
 from .smc_enhanced import EnhancedSMCStrategy
+from .mean_reversion import MeanReversionStrategy
 
 # ━━ 策略注册表 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# key = CLI 名称, value = 策略类
+# key = CLI 名称，value = 策略类
 STRATEGIES = {
     "smc": SMCStrategy,
     "smc-enhanced": EnhancedSMCStrategy,  # 机构级优化版本
+    "mean-reversion": MeanReversionStrategy,  # 均值回归策略
 }
 
 
@@ -38,8 +40,8 @@ def create_strategy(name: str, **kwargs) -> BaseStrategy:
     cls = STRATEGIES.get(name)
     if cls is None:
         available = ", ".join(sorted(STRATEGIES.keys()))
-        raise ValueError(f"未知策略 '{name}'，可用策略: {available}")
+        raise ValueError(f"未知策略 '{name}'，可用策略：{available}")
     return cls(**kwargs)
 
 
-__all__ = ["BaseStrategy", "SMCStrategy", "EnhancedSMCStrategy", "STRATEGIES", "create_strategy"]
+__all__ = ["BaseStrategy", "SMCStrategy", "EnhancedSMCStrategy", "MeanReversionStrategy", "STRATEGIES", "create_strategy"]
