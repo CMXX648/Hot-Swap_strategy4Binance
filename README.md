@@ -4,19 +4,20 @@
 
 ## 更新日志
 
-### v1.0.6 (2026-04-10)
+### v1.0.5 (2026-04-10)
 - **修复**：`engine/smc.py` 结构分析（candle 追加、ATR、pivot 更新、BOS/CHoCH 检测、FVG 创建）改为**仅在收盘 K 线执行**，消除 WebSocket intrabar tick 产生的虚假结构信号；FVG 缓解、OB 缓解、追踪极值、交易信号每个 tick 仍实时检测
 - **修复**：`engine/smc.py` `_display_structure()` 中看涨/看跌扫描各自使用对应 pivot 的 `bar_index` 作为起点（原来统一用 `high_pivot.bar_index` 导致看跌信号 scan 窗口偏早，产生非对称过度检测）
 - **修复**：`engine/smc.py` `_delete_order_blocks()` 改为接受实时 candle 参数，每 tick 使用当前价格缓解 OB，而非等待 K 线收盘
 - **新增**：`engine/smc.py` 将 `_update_fvgs()` 拆分为 `_create_fvgs()`（仅收盘）和 `_mitigate_fvgs(candle)`（每 tick），保留 `_update_fvgs()` 作为兼容别名
 - **修复**：`main.py` 补充缺失的 `import time`，导致 `_dump_chart_state()` 中 `time.time()` 抛 `NameError` 被静默吞掉，`logs/chart_state.json` 始终无法写入
 - **修复**：`main.py` 中 `_dump_chart_state()` 按 `open_time` 去重后再取最近 300 根，避免同一根 K 线的多个 tick 快照被视为多根 K 线导致图表 K 线全部叠在一点
-
-### v1.0.5 (2026-04-10)
 - **新增**：`log_web.py` 集成 TradingView Lightweight Charts，K 线图表支持 FVG 矩形（多/空）、订单块（OB 多/空）、BOS/CHoCH 箭头标记实时渲染
 - **新增**：`main.py` 新增 `_dump_chart_state()` 函数，将 SMC 引擎当前状态（K 线、FVG、OB、结构事件、趋势、ATR）原子写入 `logs/chart_state.json`，每 5 tick 或收盘时更新
 - **新增**：`log_web.py` 新增 `/api/chart` 端点，供前端每 2 秒轮询图表数据；网页从纯文本日志切换为双 Tab（K 线图 + 日志）布局
 - **新增**：图表页面顶部实时显示交易对、周期、趋势方向、ATR、FVG/OB 数量、最后更新时间
+
+![web示例](./sources/ScreenShot1.png)
+![web示例](./sources/ScreenShot2.png)
 
 ### v1.0.4 (2026-04-09)
 - **修改**：`engine/smc.py` R:R 过滤改为分级逻辑：`R:R < 1.0` 强制丢弃（任何环境）；`R:R 1.0~1.5` 仅当 MTF 高级别趋势明确对齐时允许开仓；`R:R >= 1.5` 正常开仓
@@ -154,45 +155,30 @@ STRATEGIES = {
 pip install -r requirements.txt
 
 # ━━ 推荐：使用 JSON 配置文件启动 ━━
-# 当前项目已支持 3 种运行模式：回测 / Dry-Run 模拟交易 / 实盘
+# 运行模式（backtest / dry_run / live）必须在 JSON 文件中指定，不能与 --config 同时在 CLI 传入 -b/-l/-d
+# 原因：--config 会将 JSON 中的模式标志设为 argparse 默认值，
+#       若再通过 CLI 传第二个模式标志，将触发"运行模式冲突"报错
 
-# 1) Dry-Run 模拟交易（推荐用于优化后的联调测试）
-# config.json 示例：
-# {
-#   "symbol": "BTCUSDT",
-#   "interval": "5m",
-#   "leverage": 50,
-#   "live": false,
-#   "backtest": false,
-#   "dry_run": true,
-#   "capital": 1000,
-#   "risk": 0.073,
-#   "fee": 0.0005,
-#   "position_size": 0,
-#   "qty": 0,
-#   "strategy": "smc-enhanced"
-# }
-python main.py --config config.json             # Dry-Run 模拟交易（读取 capital 作为虚拟资金）
+# 1) 回测 —— 在 config.json 中设置 "backtest": true
+python main.py --config config.json
 
-# 2) 回测
-# 将 config.json 中 "backtest" 设为 true
-python main.py -b --config config.json          # 回测
+# 2) Dry-Run 模拟交易 —— 在 config.json 中设置 "dry_run": true
+python main.py --config config.json
 
-# 3) 实盘
-# 将 config.json 中 "live" 设为 true，并提供 API Key/Secret
-python main.py -l --config config.json          # 实盘
+# 3) 实盘 —— 在 config.json 中设置 "live": true，并填写 API Key/Secret
+python main.py --config config.json
 
-# ━━ 行情监控 ━━
-python main.py BTCUSDT                          # BTC 30m
-python main.py ETHUSDT -i 1h                    # ETH 1h
+# ━━ 纯 CLI 启动（不使用配置文件时可携带模式标志） ━━
+python main.py BTCUSDT                          # BTC 30m 行情监控
+python main.py ETHUSDT -i 1h                    # ETH 1h 行情监控
 
-# ━━ Dry-Run 模拟交易（CLI 直启） ━━
-python main.py BTCUSDT --dry-run --capital 1000 # 模拟交易，使用实盘风控/下单流程但不真实下单
-python main.py --config config_enhanced.json    # 按配置文件启动 Dry-Run（当前示例配置默认即为 dry_run=true）
+python main.py BTCUSDT -b                       # 回测（默认 smc-enhanced）
+python main.py BTCUSDT -b -s smc --debug        # 指定策略并启用 DEBUG
+
+python main.py BTCUSDT --dry-run --capital 1000 # Dry-Run 模拟交易
 
 # 启用 DEBUG 日志（输出结构突破、FVG检测等详细信息）
 python main.py BTCUSDT -b --debug               # 回测并显示 DEBUG 信息
-python main.py BTCUSDT -b -s smc --debug        # 指定策略并启用 DEBUG
 
 # 固定仓位回测
 python main.py BTCUSDT -b --qty 0.01            # 每笔固定 0.01 BTC
@@ -202,18 +188,12 @@ python main.py BTCUSDT -b --position-size 5000  # 每笔固定 5000 USDT
 python main.py BTCUSDT -b --export-csv yourfilename.csv
 python main.py BTCUSDT -b --qty 0.01 --export-csv yourfilename.csv
 
-# ━━ Dry-Run 特性 ━━
-# - 使用与实盘一致的信号处理、仓位计算、FVG 分拆建仓、熔断逻辑
-# - 每根收盘 K 线检查模拟持仓的止损/止盈
-# - 支持钉钉推送，通知标签为 [SMC-DRY]
-# - 使用 --capital 或 JSON 中的 capital 作为虚拟账户资金
-
-# ━━ 实盘交易 ━━
+# ━━ 实盘（不使用配置文件） ━━
 export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 python main.py BTCUSDT --live                                   # 10x 实盘 (风险公式)
 python main.py BTCUSDT -l --leverage 50                         # 50x 实盘
-python main.py BTCUSDT -l --api-key xxx --api-secret yyy       # 使用其他账号时  直接传参
+python main.py BTCUSDT -l --api-key xxx --api-secret yyy       # 使用其他账号时直接传参
 
 # 固定仓位实盘
 python main.py BTCUSDT -l --qty 0.01 --api-key xxx --api-secret yyy           # 固定 0.01 BTC
@@ -295,9 +275,11 @@ python main.py BTCUSDT -l --position-size 5000 --api-key xxx --api-secret yyy # 
 ```
 
 ```bash
-python main.py --config config.json                   # 按配置运行（示例为 Dry-Run）
-python main.py -b --config config.json                # CLI 覆盖为回测模式
-python main.py -l --config config.json --leverage 100 # CLI 覆盖为实盘 + 覆盖 leverage
+python main.py --config config.json                   # 按 JSON 中设定的模式运行
+# ⚠️ 不要在使用 --config 时额外传 -b / -l / -d：
+#   JSON 已将模式设为默认值，CLI 再传一个模式标志会触发"运行模式冲突"报错
+# 如需临时覆盖非模式参数（如 leverage），直接追加即可：
+python main.py --config config.json --leverage 100    # 覆盖杠杆，模式仍由 JSON 决定
 ```
 
 ## 历史数据管理

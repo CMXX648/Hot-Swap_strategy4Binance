@@ -221,7 +221,7 @@ _INDEX_HTML = """<!doctype html>
     /* ── chart tab ── */
     #chart-wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; }
     #lw-chart { width: 100%; height: 100%; }
-    #fvg-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+    #fvg-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
     .legend {
       display: flex; gap: 14px; align-items: center; flex-shrink: 0;
       padding: 5px 14px; background: var(--panel); border-top: 1px solid var(--border);
@@ -352,16 +352,37 @@ _INDEX_HTML = """<!doctype html>
       if (!chartData) return;
 
       const ts = chart.timeScale();
+      const visRange = ts.getVisibleRange();
 
-      function box(top, bot, lt, fill, stroke, label) {
-        const x1 = ts.timeToCoordinate(lt);
-        if (x1 === null) return;
-        const y1 = cSeries.priceToCoordinate(top);
-        const y2 = cSeries.priceToCoordinate(bot);
-        if (y1 === null || y2 === null) return;
-        const lx = Math.max(0, x1);
+      function box(top, bot, lt, fill, stroke, label, rt) {
+        /* x: if lt is before visible range, draw from left edge (lx=0);
+           if lt is after visible range, skip; otherwise use timeToCoordinate */
+        let lx;
+        if (visRange && lt < visRange.from) {
+          lx = 0;
+        } else if (visRange && lt > visRange.to) {
+          return;
+        } else {
+          const x1 = ts.timeToCoordinate(lt);
+          if (x1 === null) return;
+          lx = Math.max(0, x1);
+        }
+        /* rx: right boundary — fixed end time (FVG) or full right edge (OB) */
+        let rx = overlay.width;
+        if (rt !== undefined) {
+          const x2 = ts.timeToCoordinate(rt);
+          if (x2 !== null) rx = Math.min(overlay.width, x2);
+          else if (visRange && rt < visRange.from) return; /* entirely left of view */
+        }
+        if (rx <= lx) return;
+        /* y: clamp prices outside visible range to canvas edges */
+        const rawY1 = cSeries.priceToCoordinate(top);
+        const rawY2 = cSeries.priceToCoordinate(bot);
+        if (rawY1 === null && rawY2 === null) return;
+        const y1 = rawY1 !== null ? rawY1 : (top > bot ? 0 : overlay.height);
+        const y2 = rawY2 !== null ? rawY2 : (top > bot ? overlay.height : 0);
         const ty = Math.min(y1, y2);
-        const bw = overlay.width - lx;
+        const bw = rx - lx;
         const bh = Math.max(1, Math.abs(y2 - y1));
         ctx.fillStyle = fill;   ctx.fillRect(lx, ty, bw, bh);
         ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.strokeRect(lx, ty, bw, bh);
@@ -376,7 +397,8 @@ _INDEX_HTML = """<!doctype html>
         box(f.top, f.bottom, f.left_time,
             b ? 'rgba(38,166,154,.15)'  : 'rgba(239,83,80,.15)',
             b ? 'rgba(38,166,154,.75)'  : 'rgba(239,83,80,.75)',
-            b ? 'FVG ▲' : 'FVG ▼');
+            b ? 'FVG ▲' : 'FVG ▼',
+            f.left_time + 3 * 300);  /* extend 3 candles (3×5min) */
       }
       for (const o of (chartData.order_blocks || [])) {
         const b = o.bias === 'BULLISH';
