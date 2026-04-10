@@ -11,6 +11,7 @@ Binance Futures WebSocket 实时数据 + 可插拔策略框架
 import os
 import sys
 import json
+import time
 import signal
 import argparse
 import logging
@@ -177,6 +178,75 @@ ws_client: BinanceWebSocket | None = None
 trader: BinanceTrader | None = None
 log = logging.getLogger("Engine")
 _ws_connect_count: int = 0   # WebSocket 连接次数，用于区分首次连接和断线重连
+_chart_state_file: Path | None = None  # 图表状态 JSON 文件路径
+_chart_dump_tick: int = 0              # 节流计数器
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  图表状态导出
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _dump_chart_state(mgr: KlineManager, out_file: Path) -> None:
+    """将 SMC 引擎当前状态原子写入 JSON 文件，供 log_web.py 图表端点读取。"""
+    engine = getattr(mgr.strategy, 'engine', None)
+    if engine is None:
+        return
+
+    CANDLE_LIMIT = 300
+    # engine.candles 包含每个 tick 的快照（同一 open_time 多条），需按 open_time 去重，
+    # 保留每根 K 线的最后一条（最新状态），再按时间排序取最近 CANDLE_LIMIT 根。
+    _seen: dict = {}
+    for c in engine.candles:
+        _seen[c.open_time] = c
+    _unique = sorted(_seen.values(), key=lambda c: c.open_time)[-CANDLE_LIMIT:]
+    candles_data = [
+        {"t": int(c.open_time // 1000), "o": c.open, "h": c.high, "l": c.low, "c": c.close, "v": c.volume}
+        for c in _unique
+    ]
+
+    fvgs_data = [
+        {"top": f.top, "bottom": f.bottom, "bias": f.bias.name,
+         "left_time": int(f.left_time // 1000), "triggered": f.triggered}
+        for f in engine.fvgs
+    ]
+
+    events_data = [
+        {"tag": e.tag.value, "bias": e.bias.name, "level": e.level,
+         "bar_time": int(e.bar_time // 1000)}
+        for e in engine.structure_events[-50:]
+    ]
+
+    obs_data = [
+        {"high": ob.bar_high, "low": ob.bar_low,
+         "time": int(ob.bar_time // 1000), "bias": ob.bias.name}
+        for ob in (engine.swing_order_blocks + engine.internal_order_blocks)
+    ]
+
+    cur = mgr.current_candle
+    cur_data = None
+    if cur is not None:
+        cur_data = {"t": int(cur.open_time // 1000), "o": cur.open,
+                    "h": cur.high, "l": cur.low, "c": cur.close, "v": cur.volume}
+
+    state = {
+        "symbol": mgr.symbol,
+        "interval": mgr.interval,
+        "updated_at": int(time.time() * 1000),
+        "candles": candles_data,
+        "current_candle": cur_data,
+        "fvgs": fvgs_data,
+        "structure_events": events_data,
+        "order_blocks": obs_data,
+        "swing_trend": engine.swing_trend.name,
+        "atr": round(engine.atr, 4),
+    }
+
+    tmp = out_file.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(out_file)
+    except OSError:
+        pass
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -200,7 +270,16 @@ def on_kline(data: dict, tick_count: int):
         )
 
     if manager:
+        global _chart_dump_tick
         signal_obj = manager.on_kline_event(data)
+
+        # 图表状态导出：收盘时必更新，否则每 5 tick 更新一次（实时 K 线动画）
+        if _chart_state_file and (is_closed or _chart_dump_tick % 5 == 0):
+            try:
+                _dump_chart_state(manager, _chart_state_file)
+            except Exception:
+                pass
+        _chart_dump_tick += 1
 
         if is_closed:
             log.info(manager.strategy.summary())
@@ -468,6 +547,11 @@ def main():
 
     if config:
         log.info(f"[CONFIG] 配置来源: {pre_args.config}")
+
+    # ━━ 图表状态文件 ━━
+    global _chart_state_file
+    if args.log_dir:
+        _chart_state_file = Path(args.log_dir) / "chart_state.json"
 
     # ━━ 验证 ━━
     if not validate(args):

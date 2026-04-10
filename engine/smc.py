@@ -252,15 +252,20 @@ class SMCEngine:
         if high_pivot.current_level == 0 or low_pivot.current_level == 0:
             return
 
-        scan_start = high_pivot.bar_index + 1 if high_pivot.bar_index > 0 else 0
+        # 看涨/看跌扫描各用各自 pivot 的 bar_index 作为起点，避免在 pivot 形成前
+        # 误检测对方方向的结构突破（原始实现统一用 high_pivot 导致看跌信号过多）
+        scan_start_bull = high_pivot.bar_index + 1 if high_pivot.bar_index > 0 else 0
+        scan_start_bear = low_pivot.bar_index + 1 if low_pivot.bar_index > 0 else 0
+        scan_start = min(scan_start_bull, scan_start_bear)
 
         for idx in range(scan_start, len(self.candles)):
             candle = self.candles[idx]
             close_price = candle.close
             prev_close = self.candles[idx - 1].close if idx > 0 else close_price
 
-            # ── 看涨突破 ──
-            if (not high_pivot.crossed and
+            # ── 看涨突破（只在 high_pivot 建立之后扫描）──
+            if (idx >= scan_start_bull and
+                not high_pivot.crossed and
                 prev_close <= high_pivot.current_level and
                 close_price > high_pivot.current_level):
 
@@ -271,8 +276,9 @@ class SMCEngine:
                         close_price, candle, internal,
                     )
 
-            # ── 看跌突破 ──
-            if (not low_pivot.crossed and
+            # ── 看跌突破（只在 low_pivot 建立之后扫描）──
+            if (idx >= scan_start_bear and
+                not low_pivot.crossed and
                 prev_close >= low_pivot.current_level and
                 close_price < low_pivot.current_level):
 
@@ -356,10 +362,12 @@ class SMCEngine:
             blocks.pop()
         blocks.insert(0, ob)
 
-    def _delete_order_blocks(self, internal: bool = False):
-        """检查 OB 是否被缓解（mitigated）"""
+    def _delete_order_blocks(self, internal: bool = False, candle: Optional[Candle] = None):
+        """检查 OB 是否被缓解（mitigated），candle 为实时 tick 价格（空则用最后收盘 K 线）"""
         blocks = self.internal_order_blocks if internal else self.swing_order_blocks
-        current = self.candles[-1]
+        current = candle if candle is not None else (self.candles[-1] if self.candles else None)
+        if current is None:
+            return
 
         if self.ob_mitigation == "CLOSE":
             bull_source = bear_source = current.close
@@ -378,11 +386,10 @@ class SMCEngine:
 
     # ━━━ FVG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _update_fvgs(self):
+    def _create_fvgs(self):
         """
-        FVG 创建 + 缓解
+        FVG 创建 — 仅在收盘时调用（3 根 K 线模型）
 
-        3 根 K 线模型：
           看涨 FVG: candle[0].low > candle[2].high
           看跌 FVG: candle[0].high < candle[2].low
         """
@@ -391,17 +398,6 @@ class SMCEngine:
 
         k2 = self.candles[-3]
         k0 = self.candles[-1]
-
-        # ── 缓解 ──
-        self.fvgs = [
-            fvg for fvg in self.fvgs
-            if not (fvg.bias == Bias.BULLISH and k0.low < fvg.bottom) and
-               not (fvg.bias == Bias.BEARISH and k0.high > fvg.top)
-        ]
-
-        # ── 创建（仅收盘时）──
-        if not k0.is_closed:
-            return
 
         threshold = self.atr * 0.1 if self.atr > 0 else 0
 
@@ -422,6 +418,20 @@ class SMCEngine:
                     left_time=k2.open_time, created_bar=len(self.candles),
                 ))
                 log.info(f"[BEAR] FVG 看跌 | ${k0.high:,.2f} → ${k2.low:,.2f} (gap={gap:,.2f})")
+
+    def _mitigate_fvgs(self, candle: Candle):
+        """FVG 缓解检测 — 每个 tick 调用，使用实时价格"""
+        self.fvgs = [
+            fvg for fvg in self.fvgs
+            if not (fvg.bias == Bias.BULLISH and candle.low < fvg.bottom) and
+               not (fvg.bias == Bias.BEARISH and candle.high > fvg.top)
+        ]
+
+    # 保留旧名称兼容（外部工具/测试可能直接调用）
+    def _update_fvgs(self):
+        self._create_fvgs()
+        if self.candles:
+            self._mitigate_fvgs(self.candles[-1])
 
     # ━━━ EQH / EQL ━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -463,24 +473,34 @@ class SMCEngine:
         """
         每根 K 线 / 每次 tick 调用
         返回 TradeSignal 或 None
+
+        架构说明：
+          - 结构分析（candle 追加、ATR、pivot、BOS/CHoCH、FVG创建）仅在 is_closed=True 时执行，
+            与 TradingView 逐 bar 处理保持一致，消除 intrabar tick 噪声导致的虚假信号。
+          - FVG 缓解、OB 缓解、追踪极值、交易信号每个 tick 都检测，确保实时入场灵敏度。
         """
-        self.candles.append(candle)
-        self._update_volatility(candle)
+        # ── 结构分析：仅限已收盘 K 线 ──
+        if candle.is_closed:
+            self.candles.append(candle)
+            self._update_volatility(candle)
 
-        # BOS/CHoCH（先检测，后更新 pivot — 与 Pine 顺序一致）
-        if len(self.candles) >= self.swing_length + 2:
-            self._display_structure(internal=False)
-        if len(self.candles) >= self.internal_length + 2:
-            self._display_structure(internal=True)
+            # BOS/CHoCH（先检测，后更新 pivot — 与 Pine 顺序一致）
+            if len(self.candles) >= self.swing_length + 2:
+                self._display_structure(internal=False)
+            if len(self.candles) >= self.internal_length + 2:
+                self._display_structure(internal=True)
 
-        if len(self.candles) >= self.swing_length + 1:
-            self._get_current_structure(self.swing_length, is_internal=False)
-        if len(self.candles) >= self.internal_length + 1:
-            self._get_current_structure(self.internal_length, is_internal=True)
+            if len(self.candles) >= self.swing_length + 1:
+                self._get_current_structure(self.swing_length, is_internal=False)
+            if len(self.candles) >= self.internal_length + 1:
+                self._get_current_structure(self.internal_length, is_internal=True)
 
-        self._update_fvgs()
-        self._delete_order_blocks(internal=True)
-        self._delete_order_blocks(internal=False)
+            self._create_fvgs()
+
+        # ── 实时检测（每个 tick）：缓解 + 追踪 + 信号 ──
+        self._mitigate_fvgs(candle)
+        self._delete_order_blocks(internal=True, candle=candle)
+        self._delete_order_blocks(internal=False, candle=candle)
         self._update_trailing(candle)
 
         # 每次 tick 都检测入场：FVG 形成后，实时价格首次回落/反弹至中点即触发

@@ -4,6 +4,20 @@
 
 ## 更新日志
 
+### v1.0.6 (2026-04-10)
+- **修复**：`engine/smc.py` 结构分析（candle 追加、ATR、pivot 更新、BOS/CHoCH 检测、FVG 创建）改为**仅在收盘 K 线执行**，消除 WebSocket intrabar tick 产生的虚假结构信号；FVG 缓解、OB 缓解、追踪极值、交易信号每个 tick 仍实时检测
+- **修复**：`engine/smc.py` `_display_structure()` 中看涨/看跌扫描各自使用对应 pivot 的 `bar_index` 作为起点（原来统一用 `high_pivot.bar_index` 导致看跌信号 scan 窗口偏早，产生非对称过度检测）
+- **修复**：`engine/smc.py` `_delete_order_blocks()` 改为接受实时 candle 参数，每 tick 使用当前价格缓解 OB，而非等待 K 线收盘
+- **新增**：`engine/smc.py` 将 `_update_fvgs()` 拆分为 `_create_fvgs()`（仅收盘）和 `_mitigate_fvgs(candle)`（每 tick），保留 `_update_fvgs()` 作为兼容别名
+- **修复**：`main.py` 补充缺失的 `import time`，导致 `_dump_chart_state()` 中 `time.time()` 抛 `NameError` 被静默吞掉，`logs/chart_state.json` 始终无法写入
+- **修复**：`main.py` 中 `_dump_chart_state()` 按 `open_time` 去重后再取最近 300 根，避免同一根 K 线的多个 tick 快照被视为多根 K 线导致图表 K 线全部叠在一点
+
+### v1.0.5 (2026-04-10)
+- **新增**：`log_web.py` 集成 TradingView Lightweight Charts，K 线图表支持 FVG 矩形（多/空）、订单块（OB 多/空）、BOS/CHoCH 箭头标记实时渲染
+- **新增**：`main.py` 新增 `_dump_chart_state()` 函数，将 SMC 引擎当前状态（K 线、FVG、OB、结构事件、趋势、ATR）原子写入 `logs/chart_state.json`，每 5 tick 或收盘时更新
+- **新增**：`log_web.py` 新增 `/api/chart` 端点，供前端每 2 秒轮询图表数据；网页从纯文本日志切换为双 Tab（K 线图 + 日志）布局
+- **新增**：图表页面顶部实时显示交易对、周期、趋势方向、ATR、FVG/OB 数量、最后更新时间
+
 ### v1.0.4 (2026-04-09)
 - **修改**：`engine/smc.py` R:R 过滤改为分级逻辑：`R:R < 1.0` 强制丢弃（任何环境）；`R:R 1.0~1.5` 仅当 MTF 高级别趋势明确对齐时允许开仓；`R:R >= 1.5` 正常开仓
 - **修改**：`engine/smc.py` 模式 A 70% 限价单入场位由 FVG 中点改为**FVG 远端内侧（中点 ± 20% × 高度）**，看涨 `limit = fvg_mid - 0.20 × fvg_size`，看跌 `limit = fvg_mid + 0.20 × fvg_size`
